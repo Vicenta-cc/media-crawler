@@ -105,6 +105,10 @@ START_PAGE = 1
 # Control the number of crawled videos/posts
 CRAWLER_MAX_NOTES_COUNT = 15
 
+# Maximum number of primary posts/videos whose processing may start per minute.
+# Users may choose a slower value from 1 to 5; 5 is the fastest allowed default.
+CRAWLER_MAX_ITEMS_PER_MINUTE = 5
+
 # Controlling the number of concurrent crawlers
 MAX_CONCURRENCY_NUM = 1
 

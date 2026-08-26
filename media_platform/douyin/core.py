@@ -82,10 +82,13 @@ class DouYinCrawler(AbstractCrawler):
                 use_background_mode=background_browser_mode,
                 background_headless=background_headless,
             )
+            await self.apply_account_auth_state(self.browser_context)
             await self._open_index_page()
 
             self.dy_client = await self.create_douyin_client(httpx_proxy_format)
             need_login = not await self.dy_client.pong(browser_context=self.browser_context)
+            if need_login and self.has_account_auth_state():
+                self.raise_account_auth_invalid()
             if (
                 need_login
                 and background_browser_mode
@@ -103,6 +106,7 @@ class DouYinCrawler(AbstractCrawler):
                     use_background_mode=True,
                     background_headless=False,
                 )
+                await self.apply_account_auth_state(self.browser_context)
                 await self._open_index_page()
                 self.dy_client = await self.create_douyin_client(httpx_proxy_format)
                 need_login = not await self.dy_client.pong(browser_context=self.browser_context)
@@ -145,6 +149,10 @@ class DouYinCrawler(AbstractCrawler):
     def _resolve_background_headless(self) -> bool:
         if self._headless_was_explicitly_set():
             return bool(config.HEADLESS)
+
+        if self.has_account_auth_state():
+            utils.logger.info("[DouYinCrawler] Using injected account state in headless mode")
+            return True
 
         has_saved_login_state = self._has_saved_login_state()
         utils.logger.info(
@@ -257,10 +265,12 @@ class DouYinCrawler(AbstractCrawler):
                         aweme_info: Dict = (post_item.get("aweme_info") or post_item.get("aweme_mix_info", {}).get("mix_items")[0])
                     except TypeError:
                         continue
-                    aweme_list.append(aweme_info.get("aweme_id", ""))
+                    aweme_id = aweme_info.get("aweme_id", "")
+                    await self.wait_for_content_slot(aweme_id)
+                    aweme_list.append(aweme_id)
                     if config.STREAM_ITEMS:
                         await self.get_aweme_media(aweme_item=aweme_info)
-                        await self.batch_get_note_comments([aweme_info.get("aweme_id", "")])
+                        await self.batch_get_note_comments([aweme_id])
                         await douyin_store.update_douyin_aweme(aweme_item=aweme_info)
                     else:
                         page_aweme_list.append(aweme_info.get("aweme_id", ""))
@@ -313,7 +323,7 @@ class DouYinCrawler(AbstractCrawler):
 
     async def get_aweme_detail(self, aweme_id: str, semaphore: asyncio.Semaphore) -> Any:
         """Get note detail"""
-        async with semaphore:
+        async with self.content_request_slot(semaphore, aweme_id):
             try:
                 result = await self.dy_client.get_video_by_id(aweme_id)
                 # Sleep after fetching aweme detail
