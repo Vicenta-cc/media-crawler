@@ -72,8 +72,13 @@ class AbstractCrawler(ABC):
         init_script = """
 (() => {
   const storageByOrigin = %s;
+  // Blank/srcdoc frames can share parent storage while reporting a null origin.
+  // Never clear shared storage unless this document has a matching snapshot.
+  if (!Object.prototype.hasOwnProperty.call(storageByOrigin, window.location.origin)) {
+    return;
+  }
   window.localStorage.clear();
-  const values = storageByOrigin[window.location.origin] || [];
+  const values = storageByOrigin[window.location.origin];
   for (const item of values) {
     if (item && typeof item.name === "string") {
       window.localStorage.setItem(item.name, String(item.value ?? ""));

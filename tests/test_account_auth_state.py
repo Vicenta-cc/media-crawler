@@ -66,3 +66,45 @@ def test_rejects_malformed_injected_state_with_account_marker():
     with patch.dict("os.environ", {ACCOUNT_AUTH_STATE_ENV: "not-base64"}):
         with pytest.raises(RuntimeError, match=ACCOUNT_AUTH_INVALID_MARKER):
             TestCrawler().load_account_auth_state()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("frame_kind", ["about_blank", "srcdoc"])
+async def test_inherited_origin_frame_preserves_parent_login_storage(frame_kind):
+    from playwright.async_api import async_playwright
+
+    state = {
+        "cookies": [],
+        "origins": [{
+            "origin": "https://www.example.com",
+            "localStorage": [{"name": "HasUserLogin", "value": "1"}],
+        }],
+    }
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(headless=True)
+        try:
+            context = await browser.new_context()
+
+            async def offline_page(route):
+                await route.fulfill(content_type="text/html", body="<html><body>Fixture</body></html>")
+
+            await context.route("**/*", offline_page)
+            with patch.dict("os.environ", {ACCOUNT_AUTH_STATE_ENV: encode_state(state)}):
+                await TestCrawler().apply_account_auth_state(context)
+            page = await context.new_page()
+            await page.goto("https://www.example.com/fixture")
+            assert await page.evaluate("localStorage.getItem('HasUserLogin')") == "1"
+            await page.evaluate("localStorage.setItem('live-session-update', 'keep')")
+            await page.evaluate("""kind => new Promise(resolve => {
+                const frame = document.createElement('iframe');
+                frame.onload = resolve;
+                if (kind === 'srcdoc') frame.srcdoc = '<html>Fixture frame</html>';
+                document.body.appendChild(frame);
+            })""", frame_kind)
+
+            assert len(page.frames) == 2
+            assert await page.frames[1].evaluate("location.origin") == "null"
+            assert await page.evaluate("localStorage.getItem('HasUserLogin')") == "1"
+            assert await page.evaluate("localStorage.getItem('live-session-update')") == "keep"
+        finally:
+            await browser.close()
