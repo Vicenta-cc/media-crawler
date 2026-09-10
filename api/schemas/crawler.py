@@ -76,6 +76,18 @@ class CrawlerStartRequest(BaseModel):
     headless: bool = False
     max_notes_count: Optional[int] = Field(default=None, ge=1, le=MAX_API_LIMIT_COUNT)
     max_comments_count: Optional[int] = Field(default=None, ge=1, le=MAX_API_LIMIT_COUNT)
+    max_items_per_minute: int = Field(
+        default=5,
+        ge=1,
+        le=5,
+        description="Maximum primary posts/videos whose processing may start per minute",
+    )
+    max_concurrency_num: int = Field(
+        default=1,
+        ge=1,
+        le=5,
+        description="Maximum number of primary content requests running concurrently",
+    )
 
 
 class CrawlerStatusResponse(BaseModel):

@@ -424,7 +424,7 @@ class BilibiliCrawler(AbstractCrawler):
         :param semaphore:
         :return:
         """
-        async with semaphore:
+        async with self.content_request_slot(semaphore, str(aid or bvid)):
             try:
                 result = await self.bili_client.get_video_info(aid=aid, bvid=bvid)
 

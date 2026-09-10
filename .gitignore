@@ -181,3 +181,12 @@ debug_tools
 
 database/*.db
 .omx/
+
+# Local runtime state and credentials
+.xhs-audit-crawler.lock
+.env.*
+!.env.example
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+.venv-*/

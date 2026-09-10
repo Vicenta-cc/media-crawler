@@ -314,14 +314,34 @@ async def parse_cmd(argv: Optional[Sequence[str]] = None):
                 rich_help_panel="Basic Configuration",
             ),
         ] = config.CRAWLER_MAX_NOTES_COUNT,
+        crawler_max_items_per_minute: Annotated[
+            int,
+            typer.Option(
+                "--crawler_max_items_per_minute",
+                min=1,
+                max=5,
+                help="Maximum primary posts/videos started per minute (1-5)",
+                rich_help_panel="Performance Configuration",
+            ),
+        ] = config.CRAWLER_MAX_ITEMS_PER_MINUTE,
         max_concurrency_num: Annotated[
             int,
             typer.Option(
                 "--max_concurrency_num",
-                help="Maximum number of concurrent crawlers",
+                min=1,
+                max=5,
+                help="Maximum number of concurrent primary content requests (1-5)",
                 rich_help_panel="Performance Configuration",
             ),
         ] = config.MAX_CONCURRENCY_NUM,
+        crawler_sleep_sec: Annotated[
+            float,
+            typer.Option(
+                "--crawler_sleep_sec",
+                help="Sleep seconds between crawler requests/pages/items",
+                rich_help_panel="Performance Configuration",
+            ),
+        ] = config.CRAWLER_MAX_SLEEP_SEC,
         save_data_path: Annotated[
             str,
             typer.Option(
@@ -397,7 +417,9 @@ async def parse_cmd(argv: Optional[Sequence[str]] = None):
         config.COOKIES = cookies
         config.CRAWLER_MAX_COMMENTS_COUNT_SINGLENOTES = max_comments_count_singlenotes
         config.CRAWLER_MAX_NOTES_COUNT = crawler_max_notes_count
+        config.CRAWLER_MAX_ITEMS_PER_MINUTE = crawler_max_items_per_minute
         config.MAX_CONCURRENCY_NUM = max_concurrency_num
+        config.CRAWLER_MAX_SLEEP_SEC = max(0.0, crawler_sleep_sec)
         config.SAVE_DATA_PATH = save_data_path
         config.ENABLE_IP_PROXY = enable_ip_proxy_value
         config.IP_PROXY_POOL_COUNT = ip_proxy_pool_count
@@ -456,6 +478,7 @@ async def parse_cmd(argv: Optional[Sequence[str]] = None):
             cookies=config.COOKIES,
             specified_id=specified_id,
             creator_id=creator_id,
+            crawler_max_items_per_minute=config.CRAWLER_MAX_ITEMS_PER_MINUTE,
         )
 
     command = typer.main.get_command(app)

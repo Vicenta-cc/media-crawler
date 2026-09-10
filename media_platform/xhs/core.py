@@ -19,7 +19,6 @@
 
 import asyncio
 import os
-import random
 from asyncio import Task
 from typing import Dict, List, Optional
 
@@ -80,11 +79,14 @@ class XiaoHongShuCrawler(AbstractCrawler):
                 use_background_mode=background_browser_mode,
                 background_headless=background_headless,
             )
+            await self.apply_account_auth_state(self.browser_context)
             await self._open_index_page()
 
             # Create a client to interact with the Xiaohongshu website.
             self.xhs_client = await self.create_xhs_client(httpx_proxy_format)
             need_login = not await self.xhs_client.pong()
+            if need_login and self.has_account_auth_state():
+                self.raise_account_auth_invalid()
             if (
                 need_login
                 and background_browser_mode
@@ -102,6 +104,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
                     use_background_mode=True,
                     background_headless=False,
                 )
+                await self.apply_account_auth_state(self.browser_context)
                 await self._open_index_page()
                 self.xhs_client = await self.create_xhs_client(httpx_proxy_format)
                 need_login = not await self.xhs_client.pong()
@@ -148,6 +151,10 @@ class XiaoHongShuCrawler(AbstractCrawler):
         if self._headless_was_explicitly_set():
             return bool(config.HEADLESS)
 
+        if self.has_account_auth_state():
+            utils.logger.info("[XiaoHongShuCrawler] Using injected account state in headless mode")
+            return True
+
         has_saved_login_state = self._has_saved_login_state()
         utils.logger.info(
             "[XiaoHongShuCrawler] Background browser mode: "
@@ -162,6 +169,13 @@ class XiaoHongShuCrawler(AbstractCrawler):
             domains=(cookie_domain,),
             platform=config.PLATFORM,
         )
+
+    async def _crawl_sleep(self, reason: str) -> None:
+        sleep_seconds = max(0.0, float(getattr(config, "CRAWLER_MAX_SLEEP_SEC", 0) or 0))
+        if sleep_seconds <= 0:
+            return
+        await asyncio.sleep(sleep_seconds)
+        utils.logger.info(f"[XiaoHongShuCrawler] Sleeping for {sleep_seconds} seconds after {reason}")
 
     async def _launch_browser_context(
         self,
@@ -260,9 +274,9 @@ class XiaoHongShuCrawler(AbstractCrawler):
                         for post_item in search_items:
                             await self.process_search_note_stream_item(post_item)
                             crawled_count += 1
+                            await self._crawl_sleep(f"stream item {post_item.get('id')}")
                         page += 1
-                        await asyncio.sleep(config.CRAWLER_MAX_SLEEP_SEC)
-                        utils.logger.info(f"[XiaoHongShuCrawler.search] Sleeping for {config.CRAWLER_MAX_SLEEP_SEC} seconds after page {page-1}")
+                        await self._crawl_sleep(f"page {page - 1}")
                         continue
 
                     semaphore = asyncio.Semaphore(config.MAX_CONCURRENCY_NUM)
@@ -287,8 +301,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
                     await self.batch_get_note_comments(note_ids, xsec_tokens)
 
                     # Sleep after each page navigation
-                    await asyncio.sleep(config.CRAWLER_MAX_SLEEP_SEC)
-                    utils.logger.info(f"[XiaoHongShuCrawler.search] Sleeping for {config.CRAWLER_MAX_SLEEP_SEC} seconds after page {page-1}")
+                    await self._crawl_sleep(f"page {page - 1}")
                 except DataFetchError:
                     utils.logger.error("[XiaoHongShuCrawler.search] Get note detail error")
                     break
@@ -411,6 +424,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
         Note: Must specify note_id, xsec_source, xsec_token
         """
         get_note_detail_task_list = []
+        semaphore = asyncio.Semaphore(config.MAX_CONCURRENCY_NUM)
         for full_note_url in config.XHS_SPECIFIED_NOTE_URL_LIST:
             note_url_info: NoteUrlInfo = parse_note_info_from_note_url(full_note_url)
             utils.logger.info(f"[XiaoHongShuCrawler.get_specified_notes] Parse note url info: {note_url_info}")
@@ -418,7 +432,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
                 note_id=note_url_info.note_id,
                 xsec_source=note_url_info.xsec_source,
                 xsec_token=note_url_info.xsec_token,
-                semaphore=asyncio.Semaphore(config.MAX_CONCURRENCY_NUM),
+                semaphore=semaphore,
             )
             get_note_detail_task_list.append(crawler_task)
 
@@ -453,7 +467,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
         """
         note_detail = None
         utils.logger.info(f"[get_note_detail_async_task] Begin get note detail, note_id: {note_id}")
-        async with semaphore:
+        async with self.content_request_slot(semaphore, note_id):
             try:
                 try:
                     note_detail = await self.xhs_client.get_note_by_id(note_id, xsec_source, xsec_token)
@@ -468,9 +482,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
 
                 note_detail.update({"xsec_token": xsec_token, "xsec_source": xsec_source})
 
-                # Sleep after fetching note detail
-                await asyncio.sleep(config.CRAWLER_MAX_SLEEP_SEC)
-                utils.logger.info(f"[get_note_detail_async_task] Sleeping for {config.CRAWLER_MAX_SLEEP_SEC} seconds after fetching note {note_id}")
+                await self._crawl_sleep(f"fetching note {note_id}")
 
                 return note_detail
 
@@ -515,9 +527,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
                 max_count=config.CRAWLER_MAX_COMMENTS_COUNT_SINGLENOTES,
             )
 
-            # Sleep after fetching comments
-            await asyncio.sleep(crawl_interval)
-            utils.logger.info(f"[XiaoHongShuCrawler.get_comments] Sleeping for {crawl_interval} seconds after fetching comments for note {note_id}")
+            await self._crawl_sleep(f"fetching comments for note {note_id}")
 
     async def create_xhs_client(self, httpx_proxy: Optional[str]) -> XiaoHongShuClient:
         """Create Xiaohongshu client"""
@@ -651,7 +661,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
             if not url:
                 continue
             content = await self.xhs_client.get_note_media(url)
-            await asyncio.sleep(random.random())
+            await self._crawl_sleep(f"fetching image media for note {note_id}")
             if content is None:
                 continue
             extension_file_name = f"{picNum}.jpg"
@@ -675,7 +685,7 @@ class XiaoHongShuCrawler(AbstractCrawler):
         videoNum = 0
         for url in videos:
             content = await self.xhs_client.get_note_media(url)
-            await asyncio.sleep(random.random())
+            await self._crawl_sleep(f"fetching video media for note {note_id}")
             if content is None:
                 continue
             extension_file_name = f"{videoNum}.mp4"

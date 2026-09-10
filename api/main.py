@@ -180,6 +180,20 @@ async def get_config_options():
             {"value": "db", "label": "MySQL Database"},
             {"value": "mongodb", "label": "MongoDB Database"},
         ],
+        "content_rate_options": [
+            {"value": 5, "label": "Up to 5 items/min (default)"},
+            {"value": 4, "label": "Up to 4 items/min"},
+            {"value": 3, "label": "Up to 3 items/min"},
+            {"value": 2, "label": "Up to 2 items/min"},
+            {"value": 1, "label": "Up to 1 item/min"},
+        ],
+        "concurrency_options": [
+            {"value": 1, "label": "1 concurrent request (default)"},
+            {"value": 2, "label": "Up to 2 concurrent requests"},
+            {"value": 3, "label": "Up to 3 concurrent requests"},
+            {"value": 4, "label": "Up to 4 concurrent requests"},
+            {"value": 5, "label": "Up to 5 concurrent requests"},
+        ],
     }
 
 

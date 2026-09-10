@@ -83,11 +83,14 @@ class KuaishouCrawler(AbstractCrawler):
                 use_background_mode=background_browser_mode,
                 background_headless=background_headless,
             )
+            await self.apply_account_auth_state(self.browser_context)
             await self._open_index_page()
 
             # Create a client to interact with the kuaishou website.
             self.ks_client = await self.create_ks_client(httpx_proxy_format)
             need_login = not await self.ks_client.pong()
+            if need_login and self.has_account_auth_state():
+                self.raise_account_auth_invalid()
             if (
                 need_login
                 and background_browser_mode
@@ -105,6 +108,7 @@ class KuaishouCrawler(AbstractCrawler):
                     use_background_mode=True,
                     background_headless=False,
                 )
+                await self.apply_account_auth_state(self.browser_context)
                 await self._open_index_page()
                 self.ks_client = await self.create_ks_client(httpx_proxy_format)
                 need_login = not await self.ks_client.pong()
@@ -150,6 +154,10 @@ class KuaishouCrawler(AbstractCrawler):
     def _resolve_background_headless(self) -> bool:
         if self._headless_was_explicitly_set():
             return bool(config.HEADLESS)
+
+        if self.has_account_auth_state():
+            utils.logger.info("[KuaishouCrawler] Using injected account state in headless mode")
+            return True
 
         has_saved_login_state = self._has_saved_login_state()
         utils.logger.info(
@@ -264,6 +272,7 @@ class KuaishouCrawler(AbstractCrawler):
                     video_id = video_detail.get("photo", {}).get("id")
                     if not video_id:
                         continue
+                    await self.wait_for_content_slot(video_id)
                     if config.STREAM_ITEMS:
                         await self.batch_get_video_comments([video_id])
                         await kuaishou_store.update_kuaishou_video(video_item=video_detail)
@@ -310,7 +319,7 @@ class KuaishouCrawler(AbstractCrawler):
         self, video_id: str, semaphore: asyncio.Semaphore
     ) -> Optional[Dict]:
         """Get video detail task"""
-        async with semaphore:
+        async with self.content_request_slot(semaphore, video_id):
             try:
                 result = await self.ks_client.get_video_info(video_id)
 

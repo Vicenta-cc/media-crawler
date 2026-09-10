@@ -169,6 +169,14 @@ uv run python -m api.main
 
 启动成功后，访问 `http://localhost:8080` 即可打开 WebUI 界面。
 
+> 抓取主内容默认限制为最多 5 条/分钟。命令行可通过
+> `--crawler_max_items_per_minute 1` 到
+> `--crawler_max_items_per_minute 5` 选择更慢频率；API 使用对应的
+> `max_items_per_minute` 字段。并发数由 `--max_concurrency_num` 控制，
+> API 对应 `max_concurrency_num`（默认 1，允许 1 到 5）。详情请求会先取得
+> 并发位置，再等待内容频率槽，避免使用过期的预约时间。评论分页和媒体
+> 下载仍由 `--crawler_sleep_sec` 单独控制。
+
 #### WebUI 功能特性
 
 - 可视化配置爬虫参数（平台、登录方式、爬取类型等）

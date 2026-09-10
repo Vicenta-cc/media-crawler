@@ -231,6 +231,13 @@ class CrawlerManager:
         if config.max_comments_count is not None:
             cmd.extend(["--max_comments_count_singlenotes", str(config.max_comments_count)])
 
+        cmd.extend([
+            "--crawler_max_items_per_minute",
+            str(config.max_items_per_minute),
+            "--max_concurrency_num",
+            str(config.max_concurrency_num),
+        ])
+
         if config.cookies:
             cmd.extend(["--cookies", config.cookies])
 

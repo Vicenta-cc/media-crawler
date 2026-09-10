@@ -191,6 +191,7 @@ class ZhihuCrawler(AbstractCrawler):
 
                     page += 1
                     for content in content_list:
+                        await self.wait_for_content_slot(content.content_id)
                         await zhihu_store.update_zhihu_content(content)
 
                     await self.batch_get_content_comments(content_list)
@@ -281,10 +282,15 @@ class ZhihuCrawler(AbstractCrawler):
             # By default, only answer information is extracted, uncomment below if articles and videos are needed
 
             # Get all anwser information of the creator
+            async def save_creator_contents(contents: List[ZhihuContent]):
+                for content_item in contents:
+                    await self.wait_for_content_slot(content_item.content_id)
+                    await zhihu_store.update_zhihu_content(content_item)
+
             all_content_list = await self.zhihu_client.get_all_anwser_by_creator(
                 creator=createor_info,
                 crawl_interval=config.CRAWLER_MAX_SLEEP_SEC,
-                callback=zhihu_store.batch_update_zhihu_contents,
+                callback=save_creator_contents,
             )
 
             # Get all articles of the creator's contents
@@ -316,7 +322,7 @@ class ZhihuCrawler(AbstractCrawler):
         Returns:
 
         """
-        async with semaphore:
+        async with self.content_request_slot(semaphore, full_note_url):
             utils.logger.info(
                 f"[ZhihuCrawler.get_specified_notes] Begin get specified note {full_note_url}"
             )
@@ -369,12 +375,13 @@ class ZhihuCrawler(AbstractCrawler):
 
         """
         get_note_detail_task_list = []
+        semaphore = asyncio.Semaphore(config.MAX_CONCURRENCY_NUM)
         for full_note_url in config.ZHIHU_SPECIFIED_ID_LIST:
             # remove query params
             full_note_url = full_note_url.split("?")[0]
             crawler_task = self.get_note_detail(
                 full_note_url=full_note_url,
-                semaphore=asyncio.Semaphore(config.MAX_CONCURRENCY_NUM),
+                semaphore=semaphore,
             )
             get_note_detail_task_list.append(crawler_task)
 

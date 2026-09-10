@@ -171,13 +171,15 @@ class WeiboCrawler(AbstractCrawler):
                 search_res = await self.wb_client.get_note_by_keyword(keyword=keyword, page=page, search_type=search_type)
                 note_id_list: List[str] = []
                 note_list = filter_search_result_card(search_res.get("cards"))
-                # If full text fetching is enabled, batch get full text of posts
-                note_list = await self.batch_get_notes_full_text(note_list)
                 for note_item in note_list:
                     if note_item:
                         mblog: Dict = note_item.get("mblog")
                         if mblog:
-                            note_id_list.append(mblog.get("id"))
+                            note_id = mblog.get("id")
+                            await self.wait_for_content_slot(str(note_id or ""))
+                            note_item = await self.get_note_full_text(note_item)
+                            mblog = note_item.get("mblog")
+                            note_id_list.append(note_id)
                             await weibo_store.update_weibo_note(note_item)
                             await self.get_note_images(mblog)
 
@@ -209,7 +211,7 @@ class WeiboCrawler(AbstractCrawler):
         :param semaphore:
         :return:
         """
-        async with semaphore:
+        async with self.content_request_slot(semaphore, note_id):
             try:
                 result = await self.wb_client.get_note_info_by_id(note_id)
 
@@ -318,9 +320,11 @@ class WeiboCrawler(AbstractCrawler):
 
                 # Create a wrapper callback to get full text before saving data
                 async def save_notes_with_full_text(note_list: List[Dict]):
-                    # If full text fetching is enabled, batch get full text first
-                    updated_note_list = await self.batch_get_notes_full_text(note_list)
-                    await weibo_store.batch_update_weibo_notes(updated_note_list)
+                    for note_item in note_list:
+                        note_id = note_item.get("mblog", {}).get("id", "")
+                        await self.wait_for_content_slot(str(note_id))
+                        updated_note = await self.get_note_full_text(note_item)
+                        await weibo_store.update_weibo_note(updated_note)
 
                 # Get all note information of the creator
                 all_notes_list = await self.wb_client.get_all_notes_by_creator_id(

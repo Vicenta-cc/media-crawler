@@ -17,13 +17,104 @@
 # 详细许可条款请参阅项目根目录下的LICENSE文件。
 # 使用本代码即表示您同意遵守上述原则和LICENSE中的所有条款。
 
+import asyncio
+import base64
+import json
+import os
 from abc import ABC, abstractmethod
-from typing import Dict, Optional
+from contextlib import asynccontextmanager
+from typing import AsyncIterator, Dict, Optional
 
 from playwright.async_api import BrowserContext, BrowserType, Playwright
 
+import config
+from tools import utils
+from tools.crawl_rate_limiter import ContentRateLimiter
+
+ACCOUNT_AUTH_STATE_ENV = "MEDIACRAWLER_ACCOUNT_AUTH_STATE_B64"
+ACCOUNT_AUTH_INVALID_MARKER = "ACCOUNT_AUTH_INVALID"
+
 
 class AbstractCrawler(ABC):
+
+    def has_account_auth_state(self) -> bool:
+        return bool(os.getenv(ACCOUNT_AUTH_STATE_ENV, "").strip())
+
+    def load_account_auth_state(self) -> dict | None:
+        encoded = os.getenv(ACCOUNT_AUTH_STATE_ENV, "").strip()
+        if not encoded:
+            return None
+        try:
+            value = json.loads(base64.b64decode(encoded, validate=True).decode("utf-8"))
+        except (ValueError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError(f"{ACCOUNT_AUTH_INVALID_MARKER}: injected storage state is invalid") from exc
+        if not isinstance(value, dict):
+            raise RuntimeError(f"{ACCOUNT_AUTH_INVALID_MARKER}: injected storage state must be an object")
+        if not isinstance(value.get("cookies", []), list) or not isinstance(value.get("origins", []), list):
+            raise RuntimeError(f"{ACCOUNT_AUTH_INVALID_MARKER}: injected storage state has invalid fields")
+        return value
+
+    async def apply_account_auth_state(self, browser_context: BrowserContext) -> bool:
+        state = self.load_account_auth_state()
+        if state is None:
+            return False
+
+        await browser_context.clear_cookies()
+        cookies = state.get("cookies") or []
+        if cookies:
+            await browser_context.add_cookies(cookies)
+
+        storage_by_origin = {
+            str(origin.get("origin") or ""): origin.get("localStorage") or []
+            for origin in state.get("origins") or []
+            if isinstance(origin, dict) and str(origin.get("origin") or "")
+        }
+        init_script = """
+(() => {
+  const storageByOrigin = %s;
+  window.localStorage.clear();
+  const values = storageByOrigin[window.location.origin] || [];
+  for (const item of values) {
+    if (item && typeof item.name === "string") {
+      window.localStorage.setItem(item.name, String(item.value ?? ""));
+    }
+  }
+})();
+""" % json.dumps(storage_by_origin, ensure_ascii=False, separators=(",", ":"))
+        await browser_context.add_init_script(script=init_script)
+        utils.logger.info(f"[{self.__class__.__name__}] Applied injected account storage state")
+        return True
+
+    def raise_account_auth_invalid(self) -> None:
+        raise RuntimeError(f"{ACCOUNT_AUTH_INVALID_MARKER}: selected account login state is no longer valid")
+
+    @asynccontextmanager
+    async def content_request_slot(
+        self,
+        semaphore: asyncio.Semaphore,
+        content_id: str = "",
+    ) -> AsyncIterator[None]:
+        """Acquire concurrency capacity before reserving a content start slot."""
+        async with semaphore:
+            await self.wait_for_content_slot(content_id)
+            yield
+
+    async def wait_for_content_slot(self, content_id: str = "") -> None:
+        """Wait until the next configured primary-content start slot."""
+        items_per_minute = config.CRAWLER_MAX_ITEMS_PER_MINUTE
+        limiter = getattr(self, "_content_rate_limiter", None)
+        if limiter is None or limiter.items_per_minute != items_per_minute:
+            limiter = ContentRateLimiter(items_per_minute)
+            self._content_rate_limiter = limiter
+
+        wait_seconds = await limiter.acquire()
+        if wait_seconds > 0:
+            content_label = f" for {content_id}" if content_id else ""
+            utils.logger.info(
+                f"[{self.__class__.__name__}] Content rate limit: waited "
+                f"{wait_seconds:.1f} seconds{content_label} "
+                f"(max {items_per_minute}/min)"
+            )
 
     @abstractmethod
     async def start(self):

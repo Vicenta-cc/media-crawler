@@ -282,7 +282,7 @@ class TieBaCrawler(AbstractCrawler):
         Returns:
 
         """
-        async with semaphore:
+        async with self.content_request_slot(semaphore, note_id):
             try:
                 utils.logger.info(
                     f"[BaiduTieBaCrawler.get_note_detail] Begin get note detail, note_id: {note_id}"
@@ -382,12 +382,17 @@ class TieBaCrawler(AbstractCrawler):
 
                 await tieba_store.save_creator(user_info=creator_info)
 
+                async def save_creator_notes(note_list: List[TiebaNote]):
+                    for note_item in note_list:
+                        await self.wait_for_content_slot(note_item.note_id)
+                        await tieba_store.update_tieba_note(note_item)
+
                 # Get all note information of the creator
                 all_notes_list = (
                     await self.tieba_client.get_all_notes_by_creator_url(
                         creator_url=creator_url,
                         crawl_interval=0,
-                        callback=tieba_store.batch_update_tieba_notes,
+                        callback=save_creator_notes,
                         max_note_count=config.CRAWLER_MAX_NOTES_COUNT,
                     )
                 )
