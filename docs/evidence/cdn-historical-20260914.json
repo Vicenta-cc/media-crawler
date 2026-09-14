@@ -1,0 +1,42 @@
+[
+  {
+    "post_id": "7651953212009794856",
+    "strategy": "historical_ua_referer",
+    "host": "v26-web.douyinvod.com",
+    "url_hash": "6c98a8c5da7d5f33",
+    "url_age_seconds": null,
+    "status": 403,
+    "content_type": "text/html",
+    "final_host": "v26-web.douyinvod.com",
+    "response_headers": {
+      "server": "openresty",
+      "date": "Mon, 14 Sep 2026 09:08:33 GMT",
+      "content-length": "325"
+    },
+    "prefix_hex": "3c68746d6c3e0a3c686561643e3c7469",
+    "denial_markers": [
+      "forbidden"
+    ]
+  },
+  {
+    "event": "historical_refresh",
+    "post_id": "7651953212009794856",
+    "candidate_count": 3
+  },
+  {
+    "post_id": "7651953212009794856",
+    "strategy": "fresh_detail_ua_referer",
+    "host": "www.douyin.com",
+    "url_hash": "8a670cefeae6d86a",
+    "url_age_seconds": 4.68,
+    "status": 200,
+    "content_type": "video/mp4",
+    "final_host": "v26-web.douyinvod.com",
+    "response_headers": {
+      "server": "openresty",
+      "date": "Mon, 14 Sep 2026 09:08:43 GMT",
+      "content-length": "163718661"
+    },
+    "prefix_hex": "000000206674797069736f6d00000200"
+  }
+]

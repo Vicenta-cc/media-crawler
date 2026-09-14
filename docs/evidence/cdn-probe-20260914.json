@@ -1,0 +1,188 @@
+[
+  {
+    "event": "search",
+    "count": 3,
+    "response_keys": [
+      "ad_info",
+      "cursor",
+      "data",
+      "douyin_ai_search_info",
+      "extra",
+      "global_doodle_config",
+      "guide_search_words",
+      "has_more",
+      "log_pb",
+      "maokai_extra",
+      "mock_recall_path",
+      "multi_columns_info",
+      "ops",
+      "path",
+      "polling_time",
+      "qc",
+      "status_code",
+      "time_cost"
+    ],
+    "verification_present": false
+  },
+  {
+    "post_id": "7683121477398351119",
+    "strategy": "bare",
+    "host": "www.douyin.com",
+    "url_hash": "426601e915e81c75",
+    "url_age_seconds": 3.6,
+    "status": 403,
+    "content_type": "text/html",
+    "final_host": "v26-web.douyinvod.com",
+    "response_headers": {
+      "server": "openresty",
+      "date": "Mon, 14 Sep 2026 08:58:14 GMT",
+      "content-length": "352"
+    },
+    "prefix_hex": "3c68746d6c3e0a3c686561643e3c7469",
+    "denial_markers": [
+      "forbidden"
+    ]
+  },
+  {
+    "post_id": "7683121477398351119",
+    "strategy": "ua",
+    "host": "www.douyin.com",
+    "url_hash": "426601e915e81c75",
+    "url_age_seconds": 8.6,
+    "status": 200,
+    "content_type": "video/mp4",
+    "final_host": "v11-weba.douyinvod.com",
+    "response_headers": {
+      "server": "tencent-cos",
+      "date": "Tue, 08 Sep 2026 15:35:21 GMT",
+      "content-length": "7017156",
+      "x-bdcdn-cache-status": "TCP_MISS"
+    },
+    "prefix_hex": "000000206674797069736f6d00000200"
+  },
+  {
+    "post_id": "7683121477398351119",
+    "strategy": "ua_referer",
+    "host": "www.douyin.com",
+    "url_hash": "426601e915e81c75",
+    "url_age_seconds": 13.6,
+    "status": 200,
+    "content_type": "video/mp4",
+    "final_host": "v11-weba.douyinvod.com",
+    "response_headers": {
+      "server": "tencent-cos",
+      "date": "Tue, 08 Sep 2026 15:35:21 GMT",
+      "content-length": "7017156",
+      "x-bdcdn-cache-status": "TCP_MISS"
+    },
+    "prefix_hex": "000000206674797069736f6d00000200"
+  },
+  {
+    "post_id": "6907893640677412096",
+    "strategy": "ua_referer",
+    "host": "www.douyin.com",
+    "url_hash": "b52b5b6a96b97f88",
+    "url_age_seconds": 18.61,
+    "status": 200,
+    "content_type": "video/mp4",
+    "final_host": "v26-web.douyinvod.com",
+    "response_headers": {
+      "server": "openresty",
+      "date": "Mon, 14 Sep 2026 08:58:29 GMT",
+      "content-length": "853187"
+    },
+    "prefix_hex": "000000206674797069736f6d00000200"
+  },
+  {
+    "post_id": "6907893640677412096",
+    "strategy": "ua",
+    "host": "www.douyin.com",
+    "url_hash": "b52b5b6a96b97f88",
+    "url_age_seconds": 23.61,
+    "status": 403,
+    "content_type": "text/html",
+    "final_host": "v26-web.douyinvod.com",
+    "response_headers": {
+      "server": "openresty",
+      "date": "Mon, 14 Sep 2026 08:58:34 GMT",
+      "content-length": "353"
+    },
+    "prefix_hex": "3c68746d6c3e0a3c686561643e3c7469",
+    "denial_markers": [
+      "forbidden"
+    ]
+  },
+  {
+    "post_id": "6907893640677412096",
+    "strategy": "bare",
+    "host": "www.douyin.com",
+    "url_hash": "b52b5b6a96b97f88",
+    "url_age_seconds": 28.61,
+    "status": 403,
+    "content_type": "text/html",
+    "final_host": "v26-web.douyinvod.com",
+    "response_headers": {
+      "server": "openresty",
+      "date": "Mon, 14 Sep 2026 08:58:39 GMT",
+      "content-length": "352"
+    },
+    "prefix_hex": "3c68746d6c3e0a3c686561643e3c7469",
+    "denial_markers": [
+      "forbidden"
+    ]
+  },
+  {
+    "post_id": "7684854808192322816",
+    "strategy": "bare",
+    "host": "www.douyin.com",
+    "url_hash": "9269792006943e43",
+    "url_age_seconds": 33.61,
+    "status": 403,
+    "content_type": "text/html",
+    "final_host": "v26-web.douyinvod.com",
+    "response_headers": {
+      "server": "openresty",
+      "date": "Mon, 14 Sep 2026 08:58:44 GMT",
+      "content-length": "353"
+    },
+    "prefix_hex": "3c68746d6c3e0a3c686561643e3c7469",
+    "denial_markers": [
+      "forbidden"
+    ]
+  },
+  {
+    "post_id": "7684854808192322816",
+    "strategy": "ua",
+    "host": "www.douyin.com",
+    "url_hash": "9269792006943e43",
+    "url_age_seconds": 38.61,
+    "status": 403,
+    "content_type": "text/html",
+    "final_host": "v26-web.douyinvod.com",
+    "response_headers": {
+      "server": "openresty",
+      "date": "Mon, 14 Sep 2026 08:58:49 GMT",
+      "content-length": "352"
+    },
+    "prefix_hex": "3c68746d6c3e0a3c686561643e3c7469",
+    "denial_markers": [
+      "forbidden"
+    ]
+  },
+  {
+    "post_id": "7684854808192322816",
+    "strategy": "ua_referer",
+    "host": "www.douyin.com",
+    "url_hash": "9269792006943e43",
+    "url_age_seconds": 43.61,
+    "status": 200,
+    "content_type": "video/mp4",
+    "final_host": "v26-web.douyinvod.com",
+    "response_headers": {
+      "server": "openresty",
+      "date": "Mon, 14 Sep 2026 08:58:54 GMT",
+      "content-length": "8008854"
+    },
+    "prefix_hex": "000000206674797069736f6d00000200"
+  }
+]

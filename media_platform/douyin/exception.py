@@ -27,3 +27,11 @@ class DataFetchError(RequestError):
 
 class IPBlockError(RequestError):
     """fetch so fast that the server block us ip"""
+
+
+class MediaDownloadError(Exception):
+    """Resource failure, deliberately separate from account/API verification."""
+
+    def __init__(self, reason: str, status_code: int | None = None):
+        super().__init__(reason)
+        self.status_code = status_code

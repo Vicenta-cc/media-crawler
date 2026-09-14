@@ -1,0 +1,27 @@
+[
+  {
+    "event": "search",
+    "keyword": "博彩",
+    "count": 0,
+    "response_keys": [
+      "cursor",
+      "data",
+      "douyin_ai_search_info",
+      "extra",
+      "global_doodle_config",
+      "guide_search_words",
+      "has_more",
+      "log_pb",
+      "maokai_extra",
+      "mock_recall_path",
+      "ops",
+      "path",
+      "polling_time",
+      "qc",
+      "search_nil_info",
+      "status_code",
+      "time_cost"
+    ],
+    "verification_present": false
+  }
+]

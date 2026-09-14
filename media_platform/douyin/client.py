@@ -20,6 +20,7 @@
 import asyncio
 import copy
 import json
+import time
 import urllib.parse
 from typing import TYPE_CHECKING, Any, Callable, Dict, Union, Optional
 
@@ -66,6 +67,8 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
         ]
         self.playwright_page = playwright_page
         self.cookie_dict = cookie_dict
+        self._media_lock = asyncio.Lock()
+        self._next_media_request = 0.0
         # Initialize proxy pool (from ProxyRefreshMixin)
         self.init_proxy_pool(proxy_ip_pool)
 
@@ -347,19 +350,45 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
             result.extend(aweme_list)
         return result
 
-    async def get_aweme_media(self, url: str) -> Union[bytes, None]:
-        async with make_async_client(proxy=self.proxy) as client:
-            try:
-                response = await client.request("GET", url, timeout=self.timeout, follow_redirects=True)
-                response.raise_for_status()
-                if not response.reason_phrase == "OK":
-                    utils.logger.error(f"[DouYinClient.get_aweme_media] request {url} err, res:{response.text}")
-                    return None
-                else:
-                    return response.content
-            except httpx.HTTPError as exc:  # some wrong when call httpx.request method, such as connection error, client error, server error or response status code is not 2xx
-                utils.logger.error(f"[DouYinClient.get_aweme_media] {exc.__class__.__name__} for {exc.request.url} - {exc}")  # Keep the original exception type name for developers to debug
-                return None
+    async def wait_for_media_slot(self):
+        async with self._media_lock:
+            await asyncio.sleep(max(0.0, self._next_media_request - time.monotonic()))
+            interval = max(0.0, float(config.DY_MEDIA_REQUEST_INTERVAL))
+            self._next_media_request = time.monotonic() + interval
+
+    async def get_aweme_media(self, url: str, *, raise_on_error: bool = False) -> Union[bytes, None]:
+        await self.wait_for_media_slot()
+        # Do not forward API Host, Cookie or Authorization to another CDN domain.
+        headers = {"Referer": "https://www.douyin.com/"}
+        if self.headers.get("User-Agent"):
+            headers["User-Agent"] = self.headers["User-Agent"]
+        host = urllib.parse.urlsplit(url).hostname
+        final_host = host
+        try:
+            async with make_async_client(proxy=self.proxy) as client:
+                response = await client.request("GET", url, headers=headers,
+                                                timeout=self.timeout, follow_redirects=True)
+            final_host = response.url.host
+            if response.status_code != 200:
+                raise MediaDownloadError("media_http_error", response.status_code)
+            mime = response.headers.get("content-type", "").split(";")[0].lower()
+            if not response.content or mime.startswith("text/") or mime in {
+                "application/json", "application/xml", "application/xhtml+xml"
+            }:
+                raise MediaDownloadError("invalid_media_response", response.status_code)
+            return response.content
+        except (httpx.HTTPError, MediaDownloadError) as exc:
+            status = getattr(exc, "status_code", None)
+            # Signed URLs, cookies and response bodies never go into failure logs.
+            utils.logger.warning(
+                f"[DouYinClient.get_aweme_media] host={host} final_host={final_host} "
+                f"status={status} error={str(exc) if isinstance(exc, MediaDownloadError) else type(exc).__name__}"
+            )
+            if raise_on_error:
+                if isinstance(exc, MediaDownloadError):
+                    raise
+                raise MediaDownloadError(type(exc).__name__) from None
+            return None
 
     async def resolve_short_url(self, short_url: str) -> str:
         """

@@ -1,0 +1,8 @@
+..........................                                               [100%]
+=============================== warnings summary ===============================
+database/models.py:23
+  /Users/ext.wanghongtao6/Documents/Codex/projects/MediaCrawler-cdn-reliability/database/models.py:23: MovedIn20Warning: The ``declarative_base()`` function is now available as sqlalchemy.orm.declarative_base(). (deprecated since: 2.0) (Background on SQLAlchemy 2.0 at: https://sqlalche.me/e/b8d9)
+    Base = declarative_base()
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+26 passed, 1 warning in 1.86s

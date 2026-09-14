@@ -23,6 +23,8 @@ import random
 from asyncio import Task
 from typing import Any, Dict, List, Optional, Tuple
 
+import httpx
+
 from playwright.async_api import (
     BrowserContext,
     BrowserType,
@@ -41,7 +43,7 @@ from tools.cdp_browser import CDPBrowserManager
 from var import crawler_type_var, source_keyword_var
 
 from .client import DouYinClient
-from .exception import DataFetchError
+from .exception import DataFetchError, MediaDownloadError
 from .field import PublishTimeType
 from .help import parse_video_info_from_url, parse_creator_info_from_url
 from .login import DouYinLogin
@@ -589,13 +591,32 @@ class DouYinCrawler(AbstractCrawler):
         aweme_id = aweme_item.get("aweme_id")
 
         # The video URL will always exist, but when it is a short video type, the file is actually an audio file.
-        video_download_url: str = douyin_store._extract_video_download_url(aweme_item)
-
-        if not video_download_url:
+        urls = douyin_store._extract_video_download_urls(aweme_item)
+        if not urls:
             return
-        content = await self.dy_client.get_aweme_media(video_download_url)
-        await asyncio.sleep(random.random())
-        if content is None:
-            return
-        extension_file_name = f"video.mp4"
-        await douyin_store.update_dy_aweme_video(aweme_id, content, extension_file_name)
+        limit = max(1, min(3, int(config.DY_MEDIA_MAX_URL_ATTEMPTS)))
+        for generation in range(2):
+            refresh_needed = False
+            for url in urls[:limit]:
+                try:
+                    content = await self.dy_client.get_aweme_media(url, raise_on_error=True)
+                except MediaDownloadError as exc:
+                    if exc.status_code == 429:
+                        utils.logger.warning(f"[DouYinCrawler.get_aweme_video] post={aweme_id} media_rate_limited")
+                        return
+                    refresh_needed |= exc.status_code in {403, 410}
+                    continue
+                if content:
+                    await douyin_store.update_dy_aweme_video(aweme_id, content, "video.mp4")
+                    return
+            if generation or not refresh_needed or not config.DY_MEDIA_REFRESH_ON_FAILURE:
+                break
+            # Refresh only after candidate exhaustion, at most once. Reuse the same account.
+            await self.dy_client.wait_for_media_slot()
+            try:
+                fresh = await self.dy_client.get_video_by_id(aweme_id)
+            except httpx.HTTPError:
+                utils.logger.warning(f"[DouYinCrawler.get_aweme_video] post={aweme_id} refresh_failed")
+                break
+            urls = douyin_store._extract_video_download_urls(fresh or {})
+        utils.logger.warning(f"[DouYinCrawler.get_aweme_video] post={aweme_id} media_download_failed")

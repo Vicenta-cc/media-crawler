@@ -1,0 +1,119 @@
+[
+  {
+    "event": "search",
+    "keyword": "盘口",
+    "count": 2,
+    "response_keys": [
+      "ad_info",
+      "cursor",
+      "data",
+      "douyin_ai_search_info",
+      "extra",
+      "global_doodle_config",
+      "guide_search_words",
+      "has_more",
+      "log_pb",
+      "maokai_extra",
+      "mock_recall_path",
+      "multi_columns_info",
+      "ops",
+      "path",
+      "polling_time",
+      "qc",
+      "status_code",
+      "time_cost"
+    ],
+    "verification_present": false
+  },
+  {
+    "event": "full_download",
+    "keyword": "盘口",
+    "post_id": "7474909597384346914",
+    "bytes": 6095971,
+    "path": "/var/folders/nm/f4xs0fds35x7jw6v7wd_7nf40000gp/T/douyin-cdn-full-y8z5089l/douyin/videos/7474909597384346914/video.mp4",
+    "sha256": "c10f27dd8adcb441bf1bc98732322b04abd8983ac2bc6c770e7c10e89a20a2cd",
+    "seconds": 2.08,
+    "mp4_complete": true
+  },
+  {
+    "event": "full_download",
+    "keyword": "盘口",
+    "post_id": "7668227664230372785",
+    "bytes": 20668408,
+    "path": "/var/folders/nm/f4xs0fds35x7jw6v7wd_7nf40000gp/T/douyin-cdn-full-y8z5089l/douyin/videos/7668227664230372785/video.mp4",
+    "sha256": "ecb7a3c1013f41df80414f80240adff744e3e39b3ac6b926fcc70cb3cedb3bcd",
+    "seconds": 6.18,
+    "mp4_complete": true
+  },
+  {
+    "event": "search",
+    "keyword": "上分",
+    "count": 2,
+    "response_keys": [
+      "ad_info",
+      "cursor",
+      "data",
+      "douyin_ai_search_info",
+      "extra",
+      "global_doodle_config",
+      "guide_search_words",
+      "has_more",
+      "log_pb",
+      "maokai_extra",
+      "mock_recall_path",
+      "multi_columns_info",
+      "ops",
+      "path",
+      "polling_time",
+      "qc",
+      "status_code",
+      "time_cost"
+    ],
+    "verification_present": false
+  },
+  {
+    "event": "full_download",
+    "keyword": "上分",
+    "post_id": "7559121836957502763",
+    "bytes": 70773835,
+    "path": "/var/folders/nm/f4xs0fds35x7jw6v7wd_7nf40000gp/T/douyin-cdn-full-y8z5089l/douyin/videos/7559121836957502763/video.mp4",
+    "sha256": "07d936cc0ffd6ade3a363e29897ef8310ddddcd47bbba84ed3f75932fe9f5c14",
+    "seconds": 24.48,
+    "mp4_complete": true
+  },
+  {
+    "event": "full_download",
+    "keyword": "上分",
+    "post_id": "7493888987153583420",
+    "bytes": 121065618,
+    "path": "/var/folders/nm/f4xs0fds35x7jw6v7wd_7nf40000gp/T/douyin-cdn-full-y8z5089l/douyin/videos/7493888987153583420/video.mp4",
+    "sha256": "473a7df1b6f779af0ce7244fa104ac08fb425f283f19f2a18d97bef347d1b59b",
+    "seconds": 38.63,
+    "mp4_complete": true
+  },
+  {
+    "event": "search",
+    "keyword": "博彩",
+    "count": 0,
+    "response_keys": [
+      "cursor",
+      "data",
+      "douyin_ai_search_info",
+      "extra",
+      "global_doodle_config",
+      "guide_search_words",
+      "has_more",
+      "log_pb",
+      "maokai_extra",
+      "mock_recall_path",
+      "ops",
+      "path",
+      "polling_time",
+      "qc",
+      "search_nil_info",
+      "status_code",
+      "time_cost"
+    ],
+    "verification_present": false
+  }
+]

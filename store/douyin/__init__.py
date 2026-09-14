@@ -128,14 +128,19 @@ def _extract_video_download_url(aweme_detail: Dict) -> str:
     Returns:
         str: Video download URL
     """
-    video_item = aweme_detail.get("video", {})
-    url_h264_list = video_item.get("play_addr_h264", {}).get("url_list", [])
-    url_256_list = video_item.get("play_addr_256", {}).get("url_list", [])
-    url_list = video_item.get("play_addr", {}).get("url_list", [])
-    actual_url_list = url_h264_list or url_256_list or url_list
-    if not actual_url_list or len(actual_url_list) < 2:
-        return ""
-    return actual_url_list[-1]
+    urls = _extract_video_download_urls(aweme_detail)
+    return urls[0] if urls else ""
+
+
+def _extract_video_download_urls(aweme_detail: Dict) -> list[str]:
+    """Keep the former preferred URL first, with distinct backups (also accept one URL)."""
+    result = []
+    video = aweme_detail.get("video") or {}
+    for field in ("play_addr_h264", "play_addr_256", "play_addr"):
+        for url in reversed((video.get(field) or {}).get("url_list") or []):
+            if isinstance(url, str) and url.startswith(("https://", "http://")) and url not in result:
+                result.append(url)
+    return result
 
 
 def _extract_music_download_url(aweme_detail: Dict) -> str:

@@ -20,6 +20,12 @@
 # Douyin platform configuration
 PUBLISH_TIME_TYPE = 0
 
+# Space media GETs and URL refreshes, including fallbacks. No burst on retry.
+DY_MEDIA_REQUEST_INTERVAL = 5.0
+# At most two candidate URLs, then one detail refresh and two fresh URLs.
+DY_MEDIA_MAX_URL_ATTEMPTS = 2
+DY_MEDIA_REFRESH_ON_FAILURE = True
+
 # Specify DY video URL list (supports multiple formats)
 # Supported formats:
 # 1. Full video URL: "https://www.douyin.com/video/7525538910311632128"
