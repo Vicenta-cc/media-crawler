@@ -23,6 +23,7 @@ PUBLISH_TIME_TYPE = 0
 # Search API returns up to this many results per offset page.
 # Keep pagination stride equal to the requested count to avoid page overlap.
 DY_SEARCH_PAGE_SIZE = 15
+DY_SKIP_AWEME_IDS_FILE = ""
 
 # Space media GETs and URL refreshes, including fallbacks. No burst on retry.
 DY_MEDIA_REQUEST_INTERVAL = 5.0

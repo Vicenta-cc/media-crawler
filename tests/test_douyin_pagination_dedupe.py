@@ -1,4 +1,5 @@
 from unittest.mock import AsyncMock
+from pathlib import Path
 
 import pytest
 
@@ -77,3 +78,32 @@ async def test_search_uses_page_size_stride_and_unique_aweme_quota(monkeypatch):
     assert [call.args[0] for call in crawler.batch_get_note_comments.await_args_list] == [
         [str(value)] for value in range(1, 17)
     ]
+
+
+@pytest.mark.asyncio
+async def test_search_skips_reusable_aweme_before_detail_media_or_comments(tmp_path, monkeypatch):
+    ids_file = tmp_path / "reusable.txt"
+    ids_file.write_text("1\n", encoding="utf-8")
+    crawler = DouYinCrawler.__new__(DouYinCrawler)
+
+    class FakeClient:
+        async def search_info_by_keyword(self, *, keyword, offset, publish_time, search_id):
+            return {"data": [{"aweme_info": {"aweme_id": "1"}}, {"aweme_info": {"aweme_id": "2"}}], "extra": {"logid": "x"}}
+
+    crawler.dy_client = FakeClient()
+    crawler.wait_for_content_slot = AsyncMock()
+    crawler.get_aweme_media = AsyncMock()
+    crawler.batch_get_note_comments = AsyncMock()
+    monkeypatch.setattr("media_platform.douyin.core.douyin_store.update_douyin_aweme", AsyncMock())
+    monkeypatch.setattr(config, "KEYWORDS", "keyword")
+    monkeypatch.setattr(config, "START_PAGE", 0)
+    monkeypatch.setattr(config, "STREAM_ITEMS", True)
+    monkeypatch.setattr(config, "CRAWLER_MAX_NOTES_COUNT", 1)
+    monkeypatch.setattr(config, "CRAWLER_MAX_SLEEP_SEC", 0)
+    monkeypatch.setattr(config, "DY_SEARCH_PAGE_SIZE", 15)
+    monkeypatch.setattr(config, "DY_SKIP_AWEME_IDS_FILE", str(ids_file))
+
+    await crawler.search()
+
+    crawler.get_aweme_media.assert_awaited_once()
+    assert crawler.get_aweme_media.await_args.kwargs["aweme_item"]["aweme_id"] == "2"

@@ -18,6 +18,7 @@
 # 使用本代码即表示您同意遵守上述原则和LICENSE中的所有条款。
 
 import asyncio
+from pathlib import Path
 import os
 import random
 from asyncio import Task
@@ -225,6 +226,17 @@ class DouYinCrawler(AbstractCrawler):
     async def search(self) -> None:
         utils.logger.info("[DouYinCrawler.search] Begin search douyin keywords")
         dy_limit_count = max(1, int(getattr(config, "DY_SEARCH_PAGE_SIZE", 15)))
+        skip_aweme_ids: set[str] = set()
+        skip_file = str(getattr(config, "DY_SKIP_AWEME_IDS_FILE", "") or "").strip()
+        if skip_file:
+            try:
+                skip_aweme_ids = {
+                    line.strip() for line in Path(skip_file).read_text(encoding="utf-8").splitlines()
+                    if line.strip()
+                }
+                utils.logger.info(f"[DouYinCrawler.search] loaded {len(skip_aweme_ids)} reusable aweme IDs")
+            except OSError as exc:
+                utils.logger.warning(f"[DouYinCrawler.search] cannot read reusable ID file: {exc}")
         if not config.STREAM_ITEMS and config.CRAWLER_MAX_NOTES_COUNT < dy_limit_count:
             config.CRAWLER_MAX_NOTES_COUNT = dy_limit_count
         start_page = config.START_PAGE  # start page number
@@ -272,6 +284,9 @@ class DouYinCrawler(AbstractCrawler):
                     if not aweme_id or aweme_id in seen_aweme_ids:
                         continue
                     seen_aweme_ids.add(aweme_id)
+                    if aweme_id in skip_aweme_ids:
+                        utils.logger.info(f"[DouYinCrawler.search] reuse existing aweme: {aweme_id}")
+                        continue
                     await self.wait_for_content_slot(aweme_id)
                     aweme_list.append(aweme_id)
                     if config.STREAM_ITEMS:

@@ -238,6 +238,15 @@ async def parse_cmd(argv: Optional[Sequence[str]] = None):
                 show_default=True,
             ),
         ] = str(config.STREAM_ITEMS),
+        skip_aweme_ids_file: Annotated[
+            str,
+            typer.Option(
+                "--skip_aweme_ids_file",
+                help="Optional newline-delimited aweme IDs whose details/comments/media are already available",
+                rich_help_panel="Runtime Configuration",
+                show_default=True,
+            ),
+        ] = "",
         headless: Annotated[
             str,
             typer.Option(
@@ -409,6 +418,7 @@ async def parse_cmd(argv: Optional[Sequence[str]] = None):
         config.ENABLE_GET_SUB_COMMENTS = enable_sub_comment
         config.ENABLE_GET_MEIDAS = enable_media
         config.STREAM_ITEMS = stream_items_value
+        config.DY_SKIP_AWEME_IDS_FILE = skip_aweme_ids_file
         config.HEADLESS = enable_headless
         config.CDP_HEADLESS = enable_headless
         config.HEADLESS_EXPLICITLY_SET = _has_option(cli_args, "--headless")
