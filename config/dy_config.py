@@ -24,6 +24,7 @@ PUBLISH_TIME_TYPE = 0
 # Keep pagination stride equal to the requested count to avoid page overlap.
 DY_SEARCH_PAGE_SIZE = 15
 DY_SKIP_AWEME_IDS_FILE = ""
+DY_REUSABLE_CONTENT_DB = ""
 
 # Space media GETs and URL refreshes, including fallbacks. No burst on retry.
 DY_MEDIA_REQUEST_INTERVAL = 5.0

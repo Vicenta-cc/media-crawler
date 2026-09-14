@@ -18,6 +18,7 @@
 # 使用本代码即表示您同意遵守上述原则和LICENSE中的所有条款。
 
 import asyncio
+import sqlite3
 from pathlib import Path
 import os
 import random
@@ -237,6 +238,13 @@ class DouYinCrawler(AbstractCrawler):
                 utils.logger.info(f"[DouYinCrawler.search] loaded {len(skip_aweme_ids)} reusable aweme IDs")
             except OSError as exc:
                 utils.logger.warning(f"[DouYinCrawler.search] cannot read reusable ID file: {exc}")
+        reusable_db = str(getattr(config, "DY_REUSABLE_CONTENT_DB", "") or "").strip()
+        reusable_conn = None
+        if reusable_db:
+            try:
+                reusable_conn = sqlite3.connect(reusable_db)
+            except sqlite3.Error as exc:
+                utils.logger.warning(f"[DouYinCrawler.search] cannot open reusable content DB: {exc}")
         if not config.STREAM_ITEMS and config.CRAWLER_MAX_NOTES_COUNT < dy_limit_count:
             config.CRAWLER_MAX_NOTES_COUNT = dy_limit_count
         start_page = config.START_PAGE  # start page number
@@ -273,6 +281,7 @@ class DouYinCrawler(AbstractCrawler):
                     break
                 dy_search_id = posts_res.get("extra", {}).get("logid", "")
                 page_aweme_list = []
+                page_ids = []
                 for post_item in posts_res.get("data"):
                     if len(aweme_list) >= config.CRAWLER_MAX_NOTES_COUNT:
                         break
@@ -284,6 +293,28 @@ class DouYinCrawler(AbstractCrawler):
                     if not aweme_id or aweme_id in seen_aweme_ids:
                         continue
                     seen_aweme_ids.add(aweme_id)
+                    page_ids.append(aweme_id)
+                if reusable_conn and page_ids:
+                    placeholders = ",".join("?" for _ in page_ids)
+                    try:
+                        rows = reusable_conn.execute(
+                            f"SELECT content_key FROM contents WHERE platform='dy' AND collection_status='complete' AND content_key IN ({placeholders})",
+                            page_ids,
+                        ).fetchall()
+                        skip_aweme_ids.update(str(row[0]) for row in rows)
+                    except sqlite3.Error as exc:
+                        utils.logger.warning(f"[DouYinCrawler.search] reusable DB lookup failed: {exc}")
+                for post_item in posts_res.get("data"):
+                    if len(aweme_list) >= config.CRAWLER_MAX_NOTES_COUNT:
+                        break
+                    try:
+                        aweme_info: Dict = (post_item.get("aweme_info") or post_item.get("aweme_mix_info", {}).get("mix_items")[0])
+                    except TypeError:
+                        continue
+                    aweme_id = aweme_info.get("aweme_id", "")
+                    if not aweme_id or aweme_id not in page_ids:
+                        continue
+                    page_ids.remove(aweme_id)
                     if aweme_id in skip_aweme_ids:
                         utils.logger.info(f"[DouYinCrawler.search] reuse existing aweme: {aweme_id}")
                         continue
@@ -305,7 +336,9 @@ class DouYinCrawler(AbstractCrawler):
                 # Sleep after each page navigation
                 await asyncio.sleep(config.CRAWLER_MAX_SLEEP_SEC)
                 utils.logger.info(f"[DouYinCrawler.search] Sleeping for {config.CRAWLER_MAX_SLEEP_SEC} seconds after page {page-1}")
-            utils.logger.info(f"[DouYinCrawler.search] keyword:{keyword}, aweme_list:{aweme_list}")
+                utils.logger.info(f"[DouYinCrawler.search] keyword:{keyword}, aweme_list:{aweme_list}")
+        if reusable_conn:
+            reusable_conn.close()
 
     async def get_specified_awemes(self):
         """Get the information and comments of the specified post from URLs or IDs"""

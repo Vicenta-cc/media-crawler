@@ -247,6 +247,15 @@ async def parse_cmd(argv: Optional[Sequence[str]] = None):
                 show_default=True,
             ),
         ] = "",
+        reusable_content_db: Annotated[
+            str,
+            typer.Option(
+                "--reusable_content_db",
+                help="Optional audit SQLite database used to skip complete historical Douyin content",
+                rich_help_panel="Runtime Configuration",
+                show_default=True,
+            ),
+        ] = "",
         headless: Annotated[
             str,
             typer.Option(
@@ -419,6 +428,7 @@ async def parse_cmd(argv: Optional[Sequence[str]] = None):
         config.ENABLE_GET_MEIDAS = enable_media
         config.STREAM_ITEMS = stream_items_value
         config.DY_SKIP_AWEME_IDS_FILE = skip_aweme_ids_file
+        config.DY_REUSABLE_CONTENT_DB = reusable_content_db
         config.HEADLESS = enable_headless
         config.CDP_HEADLESS = enable_headless
         config.HEADLESS_EXPLICITLY_SET = _has_option(cli_args, "--headless")
