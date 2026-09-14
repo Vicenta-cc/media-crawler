@@ -141,6 +141,11 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
 
         async with make_async_client(proxy=self.proxy) as client:
             response = await client.request(method, url, timeout=self.timeout, **kwargs)
+        if response.status_code in {401, 403, 429} or any(
+            marker in response.text.lower() for marker in ("verify", "captcha", "验证", "风控")
+        ):
+            utils.logger.error("ACCOUNT_VERIFY: platform request requires verification")
+            raise DataFetchError("ACCOUNT_VERIFY")
         try:
             if response.text == "" or response.text == "blocked":
                 utils.logger.error(f"request params incrr, response.text: {response.text}")
