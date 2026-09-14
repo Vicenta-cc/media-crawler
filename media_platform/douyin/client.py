@@ -32,6 +32,7 @@ from base.base_crawler import AbstractApiClient
 from proxy.proxy_mixin import ProxyRefreshMixin
 from tools import utils
 from tools.httpx_util import make_async_client
+from tools.persistent_request_gate import PersistentRequestGate
 from var import request_keyword_var
 
 if TYPE_CHECKING:
@@ -69,6 +70,14 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
         self.cookie_dict = cookie_dict
         self._media_lock = asyncio.Lock()
         self._next_media_request = 0.0
+        gate_db = str(getattr(config, "DY_REQUEST_SCHEDULER_DB", "") or "").strip()
+        self._persistent_gate = (
+            PersistentRequestGate(
+                gate_db,
+                min_interval=float(getattr(config, "DY_REQUEST_MIN_INTERVAL", 2.0)),
+                per_minute=int(getattr(config, "DY_REQUESTS_PER_MINUTE", 30)),
+            ) if gate_db else None
+        )
         # Initialize proxy pool (from ProxyRefreshMixin)
         self.init_proxy_pool(proxy_ip_pool)
 
@@ -125,6 +134,8 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
             params["a_bogus"] = a_bogus
 
     async def request(self, method, url, **kwargs):
+        if self._persistent_gate:
+            await self._persistent_gate.acquire()
         # Check whether the proxy has expired before each request
         await self._refresh_proxy_if_expired()
 
@@ -394,6 +405,8 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
             self._next_media_request = time.monotonic() + interval
 
     async def get_aweme_media(self, url: str, *, raise_on_error: bool = False) -> Union[bytes, None]:
+        if self._persistent_gate:
+            await self._persistent_gate.acquire()
         await self.wait_for_media_slot()
         # Do not forward API Host, Cookie or Authorization to another CDN domain.
         headers = {"Referer": "https://www.douyin.com/"}

@@ -256,6 +256,9 @@ async def parse_cmd(argv: Optional[Sequence[str]] = None):
                 show_default=True,
             ),
         ] = "",
+        request_scheduler_db: Annotated[str, typer.Option("--request_scheduler_db", help="SQLite file for persistent request pacing")] = "",
+        request_min_interval: Annotated[float, typer.Option("--request_min_interval", min=0.0)] = 2.0,
+        requests_per_minute: Annotated[int, typer.Option("--requests_per_minute", min=1)] = 30,
         headless: Annotated[
             str,
             typer.Option(
@@ -429,6 +432,9 @@ async def parse_cmd(argv: Optional[Sequence[str]] = None):
         config.STREAM_ITEMS = stream_items_value
         config.DY_SKIP_AWEME_IDS_FILE = skip_aweme_ids_file
         config.DY_REUSABLE_CONTENT_DB = reusable_content_db
+        config.DY_REQUEST_SCHEDULER_DB = request_scheduler_db
+        config.DY_REQUEST_MIN_INTERVAL = request_min_interval
+        config.DY_REQUESTS_PER_MINUTE = requests_per_minute
         config.HEADLESS = enable_headless
         config.CDP_HEADLESS = enable_headless
         config.HEADLESS_EXPLICITLY_SET = _has_option(cli_args, "--headless")
