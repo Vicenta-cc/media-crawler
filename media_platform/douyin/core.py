@@ -19,6 +19,7 @@
 
 import asyncio
 import sqlite3
+import json
 from pathlib import Path
 import os
 import random
@@ -298,10 +299,17 @@ class DouYinCrawler(AbstractCrawler):
                     placeholders = ",".join("?" for _ in page_ids)
                     try:
                         rows = reusable_conn.execute(
-                            f"SELECT content_key FROM contents WHERE platform='dy' AND collection_status='complete' AND content_key IN ({placeholders})",
+                            f"SELECT content_key, raw_item_path FROM contents WHERE platform='dy' AND collection_status='complete' AND content_key IN ({placeholders})",
                             page_ids,
                         ).fetchall()
-                        skip_aweme_ids.update(str(row[0]) for row in rows)
+                        for content_key, raw_item_path in rows:
+                            try:
+                                payload = json.loads(Path(str(raw_item_path)).read_text(encoding="utf-8"))
+                                item = payload.get("item") if isinstance(payload, dict) else None
+                                if isinstance(item, dict) and str(item.get("aweme_id") or "") == str(content_key):
+                                    skip_aweme_ids.add(str(content_key))
+                            except (OSError, UnicodeError, json.JSONDecodeError, TypeError):
+                                continue
                     except sqlite3.Error as exc:
                         utils.logger.warning(f"[DouYinCrawler.search] reusable DB lookup failed: {exc}")
                 for post_item in posts_res.get("data"):

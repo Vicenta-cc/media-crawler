@@ -1,6 +1,7 @@
 from unittest.mock import AsyncMock
 from pathlib import Path
 import sqlite3
+import json
 
 import pytest
 
@@ -115,9 +116,11 @@ async def test_search_skips_reusable_aweme_before_detail_media_or_comments(tmp_p
 @pytest.mark.asyncio
 async def test_search_uses_indexed_reusable_content_db(tmp_path, monkeypatch):
     db = tmp_path / "audit.sqlite3"
+    payload_path = tmp_path / "aweme-1.json"
+    payload_path.write_text(json.dumps({"item": {"aweme_id": "1"}}), encoding="utf-8")
     with sqlite3.connect(db) as conn:
-        conn.execute("CREATE TABLE contents (platform TEXT, content_key TEXT, collection_status TEXT)")
-        conn.execute("INSERT INTO contents VALUES ('dy', '1', 'complete')")
+        conn.execute("CREATE TABLE contents (platform TEXT, content_key TEXT, collection_status TEXT, raw_item_path TEXT)")
+        conn.execute("INSERT INTO contents VALUES ('dy', '1', 'complete', ?)", (str(payload_path),))
     crawler = DouYinCrawler.__new__(DouYinCrawler)
 
     class FakeClient:
