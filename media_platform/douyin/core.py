@@ -224,7 +224,7 @@ class DouYinCrawler(AbstractCrawler):
 
     async def search(self) -> None:
         utils.logger.info("[DouYinCrawler.search] Begin search douyin keywords")
-        dy_limit_count = 10  # douyin limit page fixed value
+        dy_limit_count = max(1, int(getattr(config, "DY_SEARCH_PAGE_SIZE", 15)))
         if not config.STREAM_ITEMS and config.CRAWLER_MAX_NOTES_COUNT < dy_limit_count:
             config.CRAWLER_MAX_NOTES_COUNT = dy_limit_count
         start_page = config.START_PAGE  # start page number
@@ -232,6 +232,7 @@ class DouYinCrawler(AbstractCrawler):
             source_keyword_var.set(keyword)
             utils.logger.info(f"[DouYinCrawler.search] Current keyword: {keyword}")
             aweme_list: List[str] = []
+            seen_aweme_ids: set[str] = set()
             page = 0
             dy_search_id = ""
             while len(aweme_list) < config.CRAWLER_MAX_NOTES_COUNT:
@@ -243,7 +244,7 @@ class DouYinCrawler(AbstractCrawler):
                     utils.logger.info(f"[DouYinCrawler.search] search douyin keyword: {keyword}, page: {page}")
                     posts_res = await self.dy_client.search_info_by_keyword(
                         keyword=keyword,
-                        offset=page * dy_limit_count - dy_limit_count,
+                        offset=page * dy_limit_count,
                         publish_time=PublishTimeType(config.PUBLISH_TIME_TYPE),
                         search_id=dy_search_id,
                     )
@@ -268,6 +269,9 @@ class DouYinCrawler(AbstractCrawler):
                     except TypeError:
                         continue
                     aweme_id = aweme_info.get("aweme_id", "")
+                    if not aweme_id or aweme_id in seen_aweme_ids:
+                        continue
+                    seen_aweme_ids.add(aweme_id)
                     await self.wait_for_content_slot(aweme_id)
                     aweme_list.append(aweme_id)
                     if config.STREAM_ITEMS:

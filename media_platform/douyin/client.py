@@ -272,15 +272,26 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
         :return: 评论列表
         """
         result = []
+        seen_comment_ids: set[str] = set()
         comments_has_more = 1
         comments_cursor = 0
+        previous_cursor = None
         while comments_has_more and len(result) < max_count:
             comments_res = await self.get_aweme_comments(aweme_id, comments_cursor)
             comments_has_more = comments_res.get("has_more", 0)
-            comments_cursor = comments_res.get("cursor", 0)
+            next_cursor = comments_res.get("cursor", 0)
             comments = comments_res.get("comments", [])
             if not comments:
+                if next_cursor == comments_cursor:
+                    break
+                previous_cursor, comments_cursor = comments_cursor, next_cursor
+                if comments_cursor == previous_cursor:
+                    break
                 continue
+            comments = [
+                comment for comment in comments
+                if self._take_unique_comment(comment, seen_comment_ids)
+            ]
             if len(result) + len(comments) > max_count:
                 comments = comments[:max_count - len(result)]
             result.extend(comments)
@@ -288,6 +299,9 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
                 await callback(aweme_id, comments)
 
             await asyncio.sleep(crawl_interval)
+            previous_cursor, comments_cursor = comments_cursor, next_cursor
+            if comments_cursor == previous_cursor and comments_has_more:
+                break
             if not is_fetch_sub_comments:
                 continue
             # Get secondary reviews
@@ -302,16 +316,39 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
                     while sub_comments_has_more:
                         sub_comments_res = await self.get_sub_comments(aweme_id, comment_id, sub_comments_cursor)
                         sub_comments_has_more = sub_comments_res.get("has_more", 0)
-                        sub_comments_cursor = sub_comments_res.get("cursor", 0)
+                        next_sub_comments_cursor = sub_comments_res.get("cursor", 0)
                         sub_comments = sub_comments_res.get("comments", [])
 
                         if not sub_comments:
+                            if next_sub_comments_cursor == sub_comments_cursor:
+                                break
+                            sub_comments_cursor = next_sub_comments_cursor
                             continue
+                        sub_comments = [
+                            comment for comment in sub_comments
+                            if self._take_unique_comment(comment, seen_comment_ids)
+                        ]
+                        if len(result) + len(sub_comments) > max_count:
+                            sub_comments = sub_comments[:max_count - len(result)]
                         result.extend(sub_comments)
                         if callback:  # If there is a callback function, execute the callback function
                             await callback(aweme_id, sub_comments)
                         await asyncio.sleep(crawl_interval)
+                        if next_sub_comments_cursor == sub_comments_cursor and sub_comments_has_more:
+                            break
+                        sub_comments_cursor = next_sub_comments_cursor
         return result
+
+    @staticmethod
+    def _take_unique_comment(comment: Dict, seen_comment_ids: set[str]) -> bool:
+        """Return True once per platform comment ID; retain records without an ID."""
+        comment_id = str((comment or {}).get("cid") or "").strip()
+        if not comment_id:
+            return True
+        if comment_id in seen_comment_ids:
+            return False
+        seen_comment_ids.add(comment_id)
+        return True
 
     async def get_user_info(self, sec_user_id: str):
         uri = "/aweme/v1/web/user/profile/other/"
