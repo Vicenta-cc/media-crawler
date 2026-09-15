@@ -8,6 +8,19 @@ import pytest
 import config
 from media_platform.douyin.client import DouYinClient
 from media_platform.douyin.core import DouYinCrawler
+from media_platform.douyin.exception import DataFetchError
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('error', [DataFetchError('ACCOUNT_VERIFY'), RuntimeError('signing_runtime_failed')])
+async def test_comment_failure_reaches_parent_before_post_completion(monkeypatch, error):
+    crawler = DouYinCrawler()
+    crawler.dy_client = type('Client', (), {})()
+    crawler.dy_client.get_aweme_all_comments = AsyncMock(side_effect=error)
+    monkeypatch.setattr(config, 'ENABLE_GET_COMMENTS', True)
+    monkeypatch.setattr(config, 'MAX_CONCURRENCY_NUM', 1)
+    with pytest.raises(type(error), match=str(error)):
+        await crawler.batch_get_note_comments(['fixture'])
 
 
 @pytest.mark.asyncio
@@ -81,6 +94,27 @@ async def test_search_uses_page_size_stride_and_unique_aweme_quota(monkeypatch):
     assert [call.args[0] for call in crawler.batch_get_note_comments.await_args_list] == [
         [str(value)] for value in range(1, 17)
     ]
+
+
+@pytest.mark.asyncio
+async def test_search_propagates_api_failure(monkeypatch):
+    crawler = DouYinCrawler.__new__(DouYinCrawler)
+
+    class FakeClient:
+        async def search_info_by_keyword(self, **kwargs):
+            raise DataFetchError("ACCOUNT_VERIFY")
+
+    crawler.dy_client = FakeClient()
+    monkeypatch.setattr(config, "KEYWORDS", "keyword")
+    monkeypatch.setattr(config, "START_PAGE", 0)
+    monkeypatch.setattr(config, "STREAM_ITEMS", True)
+    monkeypatch.setattr(config, "CRAWLER_MAX_NOTES_COUNT", 1)
+    monkeypatch.setattr(config, "DY_SEARCH_PAGE_SIZE", 15)
+    monkeypatch.setattr(config, "DY_SKIP_AWEME_IDS_FILE", "")
+    monkeypatch.setattr(config, "DY_REUSABLE_CONTENT_DB", "")
+
+    with pytest.raises(DataFetchError, match="ACCOUNT_VERIFY"):
+        await crawler.search()
 
 
 @pytest.mark.asyncio

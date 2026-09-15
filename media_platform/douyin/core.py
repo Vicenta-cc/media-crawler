@@ -272,9 +272,11 @@ class DouYinCrawler(AbstractCrawler):
                     if posts_res.get("data") is None or posts_res.get("data") == []:
                         utils.logger.info(f"[DouYinCrawler.search] search douyin keyword: {keyword}, page: {page} is empty,{posts_res.get('data')}`")
                         break
-                except DataFetchError:
-                    utils.logger.error(f"[DouYinCrawler.search] search douyin keyword: {keyword} failed")
-                    break
+                except DataFetchError as exc:
+                    utils.logger.error(
+                        f"[DouYinCrawler.search] search douyin keyword: {keyword} failed: {exc}"
+                    )
+                    raise
 
                 page += 1
                 if "data" not in posts_res:
@@ -413,7 +415,13 @@ class DouYinCrawler(AbstractCrawler):
             task = asyncio.create_task(self.get_comments(aweme_id, semaphore), name=aweme_id)
             task_list.append(task)
         if len(task_list) > 0:
-            await asyncio.wait(task_list)
+            try:
+                await asyncio.gather(*task_list)
+            except BaseException:
+                for task in task_list:
+                    task.cancel()
+                await asyncio.gather(*task_list, return_exceptions=True)
+                raise
 
     async def get_comments(self, aweme_id: str, semaphore: asyncio.Semaphore) -> None:
         async with semaphore:
@@ -434,6 +442,7 @@ class DouYinCrawler(AbstractCrawler):
                 utils.logger.info(f"[DouYinCrawler.get_comments] aweme_id: {aweme_id} comments have all been obtained and filtered ...")
             except DataFetchError as e:
                 utils.logger.error(f"[DouYinCrawler.get_comments] aweme_id: {aweme_id} get comments failed, error: {e}")
+                raise
 
     async def get_creators_and_videos(self) -> None:
         """
