@@ -45,6 +45,16 @@ from .help import *
 
 class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
 
+    _VERIFICATION_MARKERS = ("verify", "captcha", "验证", "风控")
+    _VERIFICATION_CONTROL_KEYS = (
+        "status_msg",
+        "status_message",
+        "message",
+        "error_msg",
+        "error_message",
+        "prompts",
+    )
+
     def __init__(
         self,
         timeout=60,  # If the crawl media option is turned on, Douyin’s short videos will require a longer timeout.
@@ -133,6 +143,44 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
             a_bogus = await get_a_bogus(uri, query_string, post_data, headers["User-Agent"], self.playwright_page)
             params["a_bogus"] = a_bogus
 
+    @classmethod
+    def _requires_verification(cls, response: httpx.Response, payload: Any) -> bool:
+        if response.status_code in {401, 403}:
+            return True
+
+        if not isinstance(payload, dict):
+            body = response.text.strip().lower()
+            return body == "blocked" or any(marker in body for marker in cls._VERIFICATION_MARKERS)
+
+        # Normal Douyin post payloads contain fields such as custom_verify and may
+        # contain the word "verify" in user-authored text. Inspect only response
+        # control fields so valid content cannot be mistaken for a challenge.
+        for key in ("verify", "captcha", "verification", "need_verify", "verify_data", "captcha_data"):
+            if payload.get(key):
+                return True
+
+        # Search can return HTTP 200 / status_code=0 / data=[] for a challenge.
+        # These are explicit control values, not matches in user-authored text.
+        nil_info = payload.get("search_nil_info")
+        if isinstance(nil_info, dict):
+            challenge_signals = ("verify_check", "verify_required", "captcha_required")
+            if any(
+                nil_info.get(key) in challenge_signals
+                for key in ("search_nil_type", "search_nil_item")
+            ):
+                return True
+
+        status_code = payload.get("status_code")
+        if status_code in (None, 0, "0"):
+            return False
+
+        control_values = [payload.get(key) for key in cls._VERIFICATION_CONTROL_KEYS]
+        extra = payload.get("extra")
+        if isinstance(extra, dict):
+            control_values.extend(extra.get(key) for key in cls._VERIFICATION_CONTROL_KEYS)
+        control_text = json.dumps(control_values, ensure_ascii=False).lower()
+        return any(marker in control_text for marker in cls._VERIFICATION_MARKERS)
+
     async def request(self, method, url, **kwargs):
         if self._persistent_gate:
             await self._persistent_gate.acquire()
@@ -141,18 +189,20 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
 
         async with make_async_client(proxy=self.proxy) as client:
             response = await client.request(method, url, timeout=self.timeout, **kwargs)
-        if response.status_code in {401, 403, 429} or any(
-            marker in response.text.lower() for marker in ("verify", "captcha", "验证", "风控")
-        ):
+
+        try:
+            payload = response.json()
+        except (ValueError, json.JSONDecodeError):
+            payload = None
+
+        if self._requires_verification(response, payload):
             utils.logger.error("ACCOUNT_VERIFY: platform request requires verification")
             raise DataFetchError("ACCOUNT_VERIFY")
-        try:
-            if response.text == "" or response.text == "blocked":
-                utils.logger.error(f"request params incrr, response.text: {response.text}")
-                raise Exception("account blocked")
-            return response.json()
-        except Exception as e:
-            raise DataFetchError(f"{e}, {response.text}")
+        if response.status_code >= 400:
+            raise DataFetchError(f"HTTP {response.status_code}")
+        if payload is None:
+            raise DataFetchError("platform response is empty or not valid JSON")
+        return payload
 
     async def get(self, uri: str, params: Optional[Dict] = None, headers: Optional[Dict] = None):
         """
