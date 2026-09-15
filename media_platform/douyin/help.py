@@ -26,15 +26,31 @@
 
 import random
 import re
+import os
+import shutil
+from pathlib import Path
 from typing import Optional
 
 import execjs
+from execjs._external_runtime import node as node_runtime
+import playwright
 from playwright.async_api import Page
 
 from model.m_douyin import VideoUrlInfo, CreatorUrlInfo
 from tools.crawler_util import extract_url_params_to_dict
 
-douyin_sign_obj = execjs.compile(open('libs/douyin.js', encoding='utf-8-sig').read())
+# Account login and crawling share the Playwright environment. Use its bundled
+# Node when the service PATH has no Node, instead of PyExecJS selecting Java.
+if shutil.which("node") is None:
+    bundled_node = Path(playwright.__file__).parent / "driver" / ("node.exe" if os.name == "nt" else "node")
+    if not bundled_node.is_file():
+        raise RuntimeError("Douyin signing requires Node.js; install the Playwright runtime")
+    os.environ["PATH"] = str(bundled_node.parent) + os.pathsep + os.environ.get("PATH", "")
+# PyExecJS 1.5.1 caches runtime availability at import, sometimes before this
+# module fixes PATH. A fresh Node runtime also handles that import ordering.
+douyin_sign_obj = node_runtime().compile(
+    (Path(__file__).resolve().parents[2] / "libs" / "douyin.js").read_text(encoding="utf-8-sig")
+)
 
 def get_web_id():
     """
