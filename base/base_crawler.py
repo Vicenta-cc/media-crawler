@@ -24,6 +24,7 @@ import os
 from abc import ABC, abstractmethod
 from contextlib import asynccontextmanager
 from typing import AsyncIterator, Dict, Optional
+from urllib.parse import urlsplit
 
 from playwright.async_api import BrowserContext, BrowserType, Playwright
 
@@ -69,24 +70,38 @@ class AbstractCrawler(ABC):
             for origin in state.get("origins") or []
             if isinstance(origin, dict) and str(origin.get("origin") or "")
         }
-        init_script = """
-(() => {
-  const storageByOrigin = %s;
-  // Blank/srcdoc frames can share parent storage while reporting a null origin.
-  // Never clear shared storage unless this document has a matching snapshot.
-  if (!Object.prototype.hasOwnProperty.call(storageByOrigin, window.location.origin)) {
-    return;
-  }
-  window.localStorage.clear();
-  const values = storageByOrigin[window.location.origin];
-  for (const item of values) {
-    if (item && typeof item.name === "string") {
-      window.localStorage.setItem(item.name, String(item.value ?? ""));
-    }
-  }
-})();
-""" % json.dumps(storage_by_origin, ensure_ascii=False, separators=(",", ":"))
-        await browser_context.add_init_script(script=init_script)
+        for origin in storage_by_origin:
+            parsed = urlsplit(origin)
+            if (parsed.scheme not in ("http", "https") or not parsed.netloc
+                    or parsed.username or parsed.password or parsed.query or parsed.fragment
+                    or parsed.path not in ("", "/")):
+                raise RuntimeError(f"{ACCOUNT_AUTH_INVALID_MARKER}: invalid storage origin")
+
+        if storage_by_origin:
+            # Seed each origin once before opening the site. A context init
+            # script would replay old credentials on every document/new tab,
+            # including after the site refreshes or explicitly clears them.
+            # This temporary page serves blank documents locally and leaves no
+            # restoration script or sentinel key in the running site.
+            storage_page = await browser_context.new_page()
+            try:
+                async def blank_document(route):
+                    await route.fulfill(status=200, content_type="text/html",
+                                        body="<!doctype html><html><head></head><body></body></html>")
+
+                await storage_page.route("**/*", blank_document)
+                for origin, values in storage_by_origin.items():
+                    await storage_page.goto(origin.rstrip("/") + "/", wait_until="domcontentloaded")
+                    await storage_page.evaluate("""values => {
+                        window.localStorage.clear();
+                        for (const item of values) {
+                            if (item && typeof item.name === "string") {
+                                window.localStorage.setItem(item.name, String(item.value ?? ""));
+                            }
+                        }
+                    }""", values)
+            finally:
+                await storage_page.close()
         utils.logger.info(f"[{self.__class__.__name__}] Applied injected account storage state")
         return True
 
