@@ -23,6 +23,7 @@ import json
 from pathlib import Path
 import os
 import random
+from contextlib import asynccontextmanager
 from asyncio import Task
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -69,6 +70,18 @@ class DouYinCrawler(AbstractCrawler):
         ]
         self.cdp_manager = None
         self.ip_proxy_pool = None  # Proxy IP pool for automatic proxy refresh
+        self._cloak_profile = None
+
+    async def apply_account_auth_state(self, browser_context) -> bool:
+        if self._cloak_profile is None:
+            return await super().apply_account_auth_state(browser_context)
+        marker = self._cloak_profile["directory"] / "auth-imported"
+        if marker.exists():
+            return False  # Preserve newer state in this account's persistent profile.
+        restored = await super().apply_account_auth_state(browser_context)
+        if restored:
+            marker.touch(mode=0o600)
+        return restored
 
     async def start(self) -> None:
         playwright_proxy_format, httpx_proxy_format = None, None
@@ -77,7 +90,7 @@ class DouYinCrawler(AbstractCrawler):
             ip_proxy_info: IpInfoModel = await self.ip_proxy_pool.get_proxy()
             playwright_proxy_format, httpx_proxy_format = utils.format_proxy_info(ip_proxy_info)
 
-        async with async_playwright() as playwright:
+        async with self._browser_lifetime() as playwright:
             background_browser_mode = self._should_use_background_browser_mode()
             background_headless = self._resolve_background_headless() if background_browser_mode else False
 
@@ -92,43 +105,10 @@ class DouYinCrawler(AbstractCrawler):
 
             self.dy_client = await self.create_douyin_client(httpx_proxy_format)
             need_login = not await self.dy_client.pong(browser_context=self.browser_context)
-            if need_login and self.has_account_auth_state():
-                self.raise_account_auth_invalid()
-            if (
-                need_login
-                and background_browser_mode
-                and background_headless
-                and not self._headless_was_explicitly_set()
-            ):
-                utils.logger.info(
-                    "[DouYinCrawler] Saved login state is unavailable, "
-                    "restarting visible browser for QR/manual login"
-                )
-                await self._close_current_browser()
-                await self._launch_browser_context(
-                    playwright=playwright,
-                    playwright_proxy=playwright_proxy_format,
-                    use_background_mode=True,
-                    background_headless=False,
-                )
-                await self.apply_account_auth_state(self.browser_context)
-                await self._open_index_page()
-                self.dy_client = await self.create_douyin_client(httpx_proxy_format)
-                need_login = not await self.dy_client.pong(browser_context=self.browser_context)
-
             if need_login:
-                login_obj = DouYinLogin(
-                    login_type=config.LOGIN_TYPE,
-                    login_phone="",  # you phone number
-                    browser_context=self.browser_context,
-                    context_page=self.context_page,
-                    cookie_str=config.COOKIES,
-                )
-                await login_obj.begin()
-                await self.dy_client.update_cookies(
-                    browser_context=self.browser_context,
-                    urls=self.cookie_urls,
-                )
+                # Account management owns login; background jobs never reopen a
+                # different browser or silently switch to an interactive login.
+                self.raise_account_auth_invalid()
             crawler_type_var.set(config.CRAWLER_TYPE)
             if config.CRAWLER_TYPE == "search":
                 # Search for notes and retrieve their comment information.
@@ -142,6 +122,20 @@ class DouYinCrawler(AbstractCrawler):
 
             utils.logger.info("[DouYinCrawler.start] Douyin Crawler finished ...")
 
+    @asynccontextmanager
+    async def _browser_lifetime(self):
+        async with async_playwright() as playwright:
+            try:
+                yield playwright
+            except BaseException:
+                try:
+                    await self._close_current_browser()
+                except Exception as cleanup_error:
+                    utils.logger.warning(f"Browser cleanup failed: {type(cleanup_error).__name__}")
+                raise
+            else:
+                await self._close_current_browser()
+
     def _should_use_background_browser_mode(self) -> bool:
         return bool(
             getattr(config, "ENABLE_BACKGROUND_BROWSER_MODE", False)
@@ -154,17 +148,7 @@ class DouYinCrawler(AbstractCrawler):
     def _resolve_background_headless(self) -> bool:
         if self._headless_was_explicitly_set():
             return bool(config.HEADLESS)
-
-        if self.has_account_auth_state():
-            utils.logger.info("[DouYinCrawler] Using injected account state in headless mode")
-            return True
-
-        has_saved_login_state = self._has_saved_login_state()
-        utils.logger.info(
-            "[DouYinCrawler] Background browser mode: "
-            f"saved_login_state={has_saved_login_state}, headless={has_saved_login_state}"
-        )
-        return has_saved_login_state
+        return True
 
     def _has_saved_login_state(self) -> bool:
         return has_saved_cookie_state(
@@ -180,37 +164,15 @@ class DouYinCrawler(AbstractCrawler):
         use_background_mode: bool,
         background_headless: bool,
     ) -> None:
-        if use_background_mode:
-            utils.logger.info(
-                "[DouYinCrawler] Launching browser using background mode "
-                f"(headless={background_headless})"
-            )
-            self.browser_context = await self.launch_browser(
-                playwright.chromium,
-                playwright_proxy,
-                None,
-                headless=background_headless,
-            )
-            await self.browser_context.add_init_script(path="libs/stealth.min.js")
-            return
-
-        if config.ENABLE_CDP_MODE:
-            utils.logger.info("[DouYinCrawler] 使用CDP模式启动浏览器")
-            self.browser_context = await self.launch_browser_with_cdp(
-                playwright,
-                playwright_proxy,
-                None,
-                headless=config.CDP_HEADLESS,
-            )
-        else:
-            utils.logger.info("[DouYinCrawler] 使用标准模式启动浏览器")
-            self.browser_context = await self.launch_browser(
-                playwright.chromium,
-                playwright_proxy,
-                user_agent=None,
-                headless=config.HEADLESS,
-            )
-            await self.browser_context.add_init_script(path="libs/stealth.min.js")
+        if os.getenv("MEDIACRAWLER_DY_BROWSER_ENGINE", "cloakbrowser") != "cloakbrowser":
+            raise ValueError("Douyin requires CloakBrowser; legacy browser fallback is disabled")
+        from tools.cloak_browser import launch_account_context
+        root = Path(os.getenv("MEDIACRAWLER_CLOAK_PROFILE_ROOT", config.DY_CLOAK_PROFILE_ROOT))
+        self.browser_context, self._cloak_profile = await launch_account_context(
+            os.getenv("MEDIACRAWLER_ACCOUNT_ID", ""), root,
+            headless=bool(config.HEADLESS) if self._headless_was_explicitly_set() else True,
+            proxy=playwright_proxy,
+        )
 
     async def _open_index_page(self) -> None:
         self.context_page = await self.browser_context.new_page()
@@ -223,7 +185,8 @@ class DouYinCrawler(AbstractCrawler):
             return
 
         if getattr(self, "browser_context", None):
-            await self.browser_context.close()
+            context, self.browser_context = self.browser_context, None
+            await context.close()
 
     async def search(self) -> None:
         utils.logger.info("[DouYinCrawler.search] Begin search douyin keywords")

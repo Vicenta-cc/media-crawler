@@ -1,5 +1,5 @@
 version = 1
-revision = 1
+revision = 3
 requires-python = ">=3.11"
 resolution-markers = [
     "python_full_version >= '3.12' and sys_platform == 'darwin'",
@@ -282,6 +282,20 @@ dependencies = [
 sdist = { url = "https://pypi.tuna.tsinghua.edu.cn/packages/60/6c/8ca2efa64cf75a977a0d7fac081354553ebe483345c734fb6b6515d96bbc/click-8.2.1.tar.gz", hash = "sha256:27c491cc05d968d271d5a1db13e3b5a184636d9d930f148c50b038f0d0646202", size = 286342 }
 wheels = [
     { url = "https://pypi.tuna.tsinghua.edu.cn/packages/85/32/10bb5764d90a8eee674e9dc6f4db6a0ab47c8c4d0d83c27f7c39ac415a4d/click-8.2.1-py3-none-any.whl", hash = "sha256:61a3265b914e850b85317d0b3109c7f8cd35a670f963866005d6ef1d5175a12b", size = 102215 },
+]
+
+[[package]]
+name = "cloakbrowser"
+version = "0.5.10"
+source = { registry = "https://pypi.tuna.tsinghua.edu.cn/simple" }
+dependencies = [
+    { name = "cryptography" },
+    { name = "httpx" },
+    { name = "playwright" },
+]
+sdist = { url = "https://pypi.tuna.tsinghua.edu.cn/packages/75/64/1e508d0f49f6e1b0646bfe0e87e81ab5757096cc55e61340513ebf3af4f7/cloakbrowser-0.5.10.tar.gz", hash = "sha256:143ffcc22b7480870920fa0941436e22facdabb6f8f24035c6927e67538ad6da", size = 5755341 }
+wheels = [
+    { url = "https://pypi.tuna.tsinghua.edu.cn/packages/33/bb/06e84b852c965d895abfa9c334f1ade04e1a88662858926dfda6f79b4e87/cloakbrowser-0.5.10-py3-none-any.whl", hash = "sha256:2315a5aed8992c29212231f9924db6e5f444b0b6cb96b5f3a2241f306dc0e37f", size = 134753 },
 ]
 
 [[package]]
@@ -837,6 +851,7 @@ dependencies = [
     { name = "alembic" },
     { name = "asyncmy" },
     { name = "asyncpg" },
+    { name = "cloakbrowser" },
     { name = "cryptography" },
     { name = "fastapi" },
     { name = "httpx" },
@@ -875,6 +890,7 @@ requires-dist = [
     { name = "alembic", specifier = ">=1.16.5" },
     { name = "asyncmy", specifier = ">=0.2.10" },
     { name = "asyncpg", specifier = ">=0.31.0" },
+    { name = "cloakbrowser", specifier = "==0.5.10" },
     { name = "cryptography", specifier = ">=45.0.7" },
     { name = "fastapi", specifier = "==0.110.2" },
     { name = "httpx", specifier = "==0.28.1" },
