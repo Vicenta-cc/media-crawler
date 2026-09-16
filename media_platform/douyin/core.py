@@ -254,7 +254,14 @@ class DouYinCrawler(AbstractCrawler):
                 utils.logger.warning(f"[DouYinCrawler.search] cannot open reusable content DB: {exc}")
         if not config.STREAM_ITEMS and config.CRAWLER_MAX_NOTES_COUNT < dy_limit_count:
             config.CRAWLER_MAX_NOTES_COUNT = dy_limit_count
-        start_page = config.START_PAGE  # initial page for each keyword
+        configured_start_page = max(0, int(config.START_PAGE))
+        # The CLI and product settings are one-based. Douyin's search offset is
+        # zero-based; keep 0 as a backwards-compatible alias for the first page.
+        start_page = configured_start_page - 1 if configured_start_page > 0 else 0
+        page_limit = max(1, int(getattr(config, "DY_SEARCH_MAX_PAGES", 1000)))
+        no_progress_limit = max(
+            1, int(getattr(config, "DY_SEARCH_MAX_NO_PROGRESS_PAGES", 3))
+        )
         resume_keyword = str(getattr(config, "SEARCH_RESUME_KEYWORD", "") or "").strip()
         resume_page = int(getattr(config, "SEARCH_RESUME_PAGE", -1))
         for raw_keyword in config.KEYWORDS.split(","):
@@ -290,13 +297,16 @@ class DouYinCrawler(AbstractCrawler):
                 if resume_keyword and keyword == resume_keyword and resume_page >= 0
                 else start_page
             )
-            page = 0
+            page = keyword_start_page
+            requested_pages = 0
+            no_progress_pages = 0
             dy_search_id = ""
             while len(aweme_list) < config.CRAWLER_MAX_NOTES_COUNT:
-                if page < keyword_start_page:
-                    utils.logger.info(f"[DouYinCrawler.search] Skip {page}")
-                    page += 1
-                    continue
+                if requested_pages >= page_limit:
+                    raise DataFetchError(
+                        "COLLECTION_INCOMPLETE: search_page_budget_exceeded"
+                    )
+                requested_pages += 1
                 try:
                     utils.logger.info(f"[DouYinCrawler.search] search douyin keyword: {keyword}, page: {page}")
                     posts_res = await self.dy_client.search_info_by_keyword(
@@ -314,7 +324,6 @@ class DouYinCrawler(AbstractCrawler):
                     )
                     raise
 
-                page += 1
                 if "data" not in posts_res:
                     utils.logger.error(f"[DouYinCrawler.search] search douyin keyword: {keyword} failed，账号也许被风控了。")
                     break
@@ -333,6 +342,7 @@ class DouYinCrawler(AbstractCrawler):
                         continue
                     seen_aweme_ids.add(aweme_id)
                     page_ids.append(aweme_id)
+                new_unique_count = len(page_ids)
                 if reusable_conn and page_ids:
                     placeholders = ",".join("?" for _ in page_ids)
                     try:
@@ -375,9 +385,21 @@ class DouYinCrawler(AbstractCrawler):
                     await self.batch_get_note_comments(page_aweme_list)
 
                 # Sleep after each page navigation
+                completed_page = page
+                page += 1
                 await asyncio.sleep(config.CRAWLER_MAX_SLEEP_SEC)
-                utils.logger.info(f"[DouYinCrawler.search] Sleeping for {config.CRAWLER_MAX_SLEEP_SEC} seconds after page {page-1}")
+                utils.logger.info(f"[DouYinCrawler.search] Sleeping for {config.CRAWLER_MAX_SLEEP_SEC} seconds after page {completed_page}")
                 utils.logger.info(f"[DouYinCrawler.search] keyword:{keyword}, aweme_list:{aweme_list}")
+                has_more = posts_res.get("has_more")
+                if has_more is not None and not bool(has_more):
+                    break
+                no_progress_pages = (
+                    0 if new_unique_count else no_progress_pages + 1
+                )
+                if no_progress_pages >= no_progress_limit:
+                    raise DataFetchError(
+                        "COLLECTION_INCOMPLETE: search_pagination_stalled"
+                    )
         if reusable_conn:
             reusable_conn.close()
 

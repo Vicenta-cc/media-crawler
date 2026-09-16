@@ -399,9 +399,10 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
                 await callback(aweme_id, comments)
 
             previous_cursor, comments_cursor = comments_cursor, next_cursor
-            if comments_cursor == previous_cursor and comments_has_more:
-                break
+            cursor_stalled = comments_cursor == previous_cursor and comments_has_more
             if not is_fetch_sub_comments:
+                if cursor_stalled:
+                    break
                 continue
             # Get secondary reviews
             for comment in comments:
@@ -441,6 +442,8 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
                         if next_sub_comments_cursor == sub_comments_cursor and sub_comments_has_more:
                             break
                         sub_comments_cursor = next_sub_comments_cursor
+            if cursor_stalled:
+                break
         return result
 
     @staticmethod

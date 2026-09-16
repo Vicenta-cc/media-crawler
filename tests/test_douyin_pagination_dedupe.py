@@ -85,6 +85,161 @@ async def test_comment_empty_page_with_stalled_cursor_exits():
 
 
 @pytest.mark.asyncio
+async def test_stalled_root_cursor_keeps_current_page_subcomments():
+    client = DouYinClient.__new__(DouYinClient)
+    client.get_aweme_comments = AsyncMock(
+        return_value={
+            "has_more": 1,
+            "cursor": 0,
+            "comments": [{"cid": "root", "reply_comment_total": 1}],
+        }
+    )
+    client.get_sub_comments = AsyncMock(
+        return_value={
+            "has_more": 0,
+            "cursor": 1,
+            "comments": [{"cid": "reply"}],
+        }
+    )
+
+    result = await client.get_aweme_all_comments(
+        "post", is_fetch_sub_comments=True, crawl_interval=0, max_count=5
+    )
+
+    assert [comment["cid"] for comment in result] == ["root", "reply"]
+    client.get_aweme_comments.assert_awaited_once()
+    client.get_sub_comments.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("configured_start_page", "expected_offset"),
+    [(0, 0), (1, 0), (2, 15)],
+)
+async def test_user_start_page_maps_to_douyin_offset_and_honors_has_more(
+    monkeypatch, configured_start_page, expected_offset
+):
+    crawler = DouYinCrawler.__new__(DouYinCrawler)
+    offsets = []
+
+    class FakeClient:
+        async def search_info_by_keyword(self, *, keyword, offset, publish_time, search_id):
+            offsets.append(offset)
+            return {
+                "has_more": 0,
+                "data": [{"aweme_info": {"aweme_id": "only"}}],
+                "extra": {"logid": "final"},
+            }
+
+    crawler.dy_client = FakeClient()
+    crawler.wait_for_content_slot = AsyncMock()
+    crawler.get_aweme_media = AsyncMock()
+    crawler.batch_get_note_comments = AsyncMock()
+    monkeypatch.setattr("media_platform.douyin.core.douyin_store.update_douyin_aweme", AsyncMock())
+    for name, value in (
+        ("KEYWORDS", "keyword"),
+        ("START_PAGE", configured_start_page),
+        ("STREAM_ITEMS", True),
+        ("CRAWLER_MAX_NOTES_COUNT", 2),
+        ("CRAWLER_MAX_SLEEP_SEC", 0),
+        ("DY_SEARCH_PAGE_SIZE", 15),
+        ("DY_SKIP_AWEME_IDS_FILE", ""),
+        ("DY_REUSABLE_CONTENT_DB", ""),
+        ("SEARCH_RESUME_KEYWORD", ""),
+        ("SEARCH_RESUME_PAGE", -1),
+    ):
+        monkeypatch.setattr(config, name, value)
+
+    await crawler.search()
+
+    assert offsets == [expected_offset]
+    crawler.get_aweme_media.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_search_repeated_page_fails_after_no_progress_limit(monkeypatch):
+    crawler = DouYinCrawler.__new__(DouYinCrawler)
+    offsets = []
+
+    class FakeClient:
+        async def search_info_by_keyword(self, *, keyword, offset, publish_time, search_id):
+            offsets.append(offset)
+            return {
+                "has_more": 1,
+                "data": [{"aweme_info": {"aweme_id": "same"}}],
+                "extra": {"logid": f"log-{offset}"},
+            }
+
+    crawler.dy_client = FakeClient()
+    crawler.wait_for_content_slot = AsyncMock()
+    crawler.get_aweme_media = AsyncMock()
+    crawler.batch_get_note_comments = AsyncMock()
+    monkeypatch.setattr("media_platform.douyin.core.douyin_store.update_douyin_aweme", AsyncMock())
+    for name, value in (
+        ("KEYWORDS", "keyword"),
+        ("START_PAGE", 1),
+        ("STREAM_ITEMS", True),
+        ("CRAWLER_MAX_NOTES_COUNT", 2),
+        ("CRAWLER_MAX_SLEEP_SEC", 0),
+        ("DY_SEARCH_PAGE_SIZE", 15),
+        ("DY_SEARCH_MAX_PAGES", 10),
+        ("DY_SEARCH_MAX_NO_PROGRESS_PAGES", 2),
+        ("DY_SKIP_AWEME_IDS_FILE", ""),
+        ("DY_REUSABLE_CONTENT_DB", ""),
+        ("SEARCH_RESUME_KEYWORD", ""),
+        ("SEARCH_RESUME_PAGE", -1),
+    ):
+        monkeypatch.setattr(config, name, value)
+
+    with pytest.raises(DataFetchError, match="search_pagination_stalled"):
+        await crawler.search()
+
+    assert offsets == [0, 15, 30]
+    assert crawler.get_aweme_media.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_search_page_budget_bounds_unique_pages(monkeypatch):
+    crawler = DouYinCrawler.__new__(DouYinCrawler)
+    offsets = []
+
+    class FakeClient:
+        async def search_info_by_keyword(self, *, keyword, offset, publish_time, search_id):
+            offsets.append(offset)
+            return {
+                "has_more": 1,
+                "data": [{"aweme_info": {"aweme_id": str(offset)}}],
+                "extra": {"logid": f"log-{offset}"},
+            }
+
+    crawler.dy_client = FakeClient()
+    crawler.wait_for_content_slot = AsyncMock()
+    crawler.get_aweme_media = AsyncMock()
+    crawler.batch_get_note_comments = AsyncMock()
+    monkeypatch.setattr("media_platform.douyin.core.douyin_store.update_douyin_aweme", AsyncMock())
+    for name, value in (
+        ("KEYWORDS", "keyword"),
+        ("START_PAGE", 1),
+        ("STREAM_ITEMS", True),
+        ("CRAWLER_MAX_NOTES_COUNT", 10),
+        ("CRAWLER_MAX_SLEEP_SEC", 0),
+        ("DY_SEARCH_PAGE_SIZE", 15),
+        ("DY_SEARCH_MAX_PAGES", 2),
+        ("DY_SEARCH_MAX_NO_PROGRESS_PAGES", 3),
+        ("DY_SKIP_AWEME_IDS_FILE", ""),
+        ("DY_REUSABLE_CONTENT_DB", ""),
+        ("SEARCH_RESUME_KEYWORD", ""),
+        ("SEARCH_RESUME_PAGE", -1),
+    ):
+        monkeypatch.setattr(config, name, value)
+
+    with pytest.raises(DataFetchError, match="search_page_budget_exceeded"):
+        await crawler.search()
+
+    assert offsets == [0, 15]
+
+
+@pytest.mark.asyncio
 async def test_search_uses_page_size_stride_and_unique_aweme_quota(monkeypatch):
     crawler = DouYinCrawler.__new__(DouYinCrawler)
     offsets = []

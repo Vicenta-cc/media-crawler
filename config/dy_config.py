@@ -23,6 +23,8 @@ PUBLISH_TIME_TYPE = 0
 # Search API returns up to this many results per offset page.
 # Keep pagination stride equal to the requested count to avoid page overlap.
 DY_SEARCH_PAGE_SIZE = 15
+DY_SEARCH_MAX_PAGES = 1000
+DY_SEARCH_MAX_NO_PROGRESS_PAGES = 3
 DY_SKIP_AWEME_IDS_FILE = ""
 DY_REUSABLE_CONTENT_DB = ""
 DY_REQUEST_SCHEDULER_DB = ""
