@@ -251,14 +251,44 @@ async def parse_cmd(argv: Optional[Sequence[str]] = None):
             str,
             typer.Option(
                 "--reusable_content_db",
-                help="Optional audit SQLite database used to skip complete historical Douyin content",
+                help="Optional audit SQLite database used to skip complete historical content",
                 rich_help_panel="Runtime Configuration",
                 show_default=True,
             ),
         ] = "",
+        current_task_id: Annotated[
+            str,
+            typer.Option(
+                "--current_task_id",
+                help="Current audit task used to count already collected items during resume",
+                rich_help_panel="Runtime Configuration",
+                show_default=True,
+            ),
+        ] = "",
+        resume_keyword: Annotated[
+            str,
+            typer.Option(
+                "--resume_keyword",
+                help="Keyword that should resume from resume_page; other keywords use start",
+                rich_help_panel="Runtime Configuration",
+                show_default=True,
+            ),
+        ] = "",
+        resume_page: Annotated[
+            int,
+            typer.Option(
+                "--resume_page",
+                help="Saved page for resume_keyword; negative values disable keyword resume",
+                rich_help_panel="Runtime Configuration",
+                show_default=True,
+            ),
+        ] = -1,
         request_scheduler_db: Annotated[str, typer.Option("--request_scheduler_db", help="SQLite file for persistent request pacing")] = "",
         request_min_interval: Annotated[float, typer.Option("--request_min_interval", min=0.0)] = 2.0,
         requests_per_minute: Annotated[int, typer.Option("--requests_per_minute", min=1)] = 30,
+        request_concurrency: Annotated[int, typer.Option("--request_concurrency", min=1)] = 1,
+        media_request_interval: Annotated[float, typer.Option("--media_request_interval", min=0.0)] = 5.0,
+        request_cooldown_seconds: Annotated[float, typer.Option("--request_cooldown_seconds", min=0.0)] = 300.0,
         headless: Annotated[
             str,
             typer.Option(
@@ -432,9 +462,16 @@ async def parse_cmd(argv: Optional[Sequence[str]] = None):
         config.STREAM_ITEMS = stream_items_value
         config.DY_SKIP_AWEME_IDS_FILE = skip_aweme_ids_file
         config.DY_REUSABLE_CONTENT_DB = reusable_content_db
+        config.XHS_REUSABLE_CONTENT_DB = reusable_content_db
+        config.CURRENT_TASK_ID = current_task_id
+        config.SEARCH_RESUME_KEYWORD = resume_keyword.strip()
+        config.SEARCH_RESUME_PAGE = resume_page
         config.DY_REQUEST_SCHEDULER_DB = request_scheduler_db
         config.DY_REQUEST_MIN_INTERVAL = request_min_interval
         config.DY_REQUESTS_PER_MINUTE = requests_per_minute
+        config.DY_REQUEST_CONCURRENCY = request_concurrency
+        config.DY_MEDIA_REQUEST_INTERVAL = media_request_interval
+        config.DY_REQUEST_COOLDOWN_SECONDS = request_cooldown_seconds
         config.HEADLESS = enable_headless
         config.CDP_HEADLESS = enable_headless
         config.HEADLESS_EXPLICITLY_SET = _has_option(cli_args, "--headless")

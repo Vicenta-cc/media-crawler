@@ -35,6 +35,21 @@ def project_root_path():
     return project_root
 
 
+@pytest.fixture(autouse=True)
+def isolated_douyin_scheduler(tmp_path, monkeypatch):
+    """Exercise the real gate against isolated state without delaying tests."""
+    import config
+
+    monkeypatch.setenv(
+        "MEDIACRAWLER_REQUEST_SCHEDULER_DB",
+        str(tmp_path / "requests.sqlite3"),
+    )
+    monkeypatch.setattr(config, "DY_REQUEST_MIN_INTERVAL", 0.0)
+    monkeypatch.setattr(config, "DY_REQUESTS_PER_MINUTE", 10000)
+    monkeypatch.setattr(config, "DY_MEDIA_REQUEST_INTERVAL", 0.0)
+    monkeypatch.setattr(config, "DY_REQUEST_CONCURRENCY", 1)
+
+
 @pytest.fixture
 def sample_xhs_note():
     """Sample Xiaohongshu note data for testing"""

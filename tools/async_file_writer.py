@@ -27,6 +27,11 @@ import config
 from tools.utils import utils
 from tools.words import AsyncWordCloudGenerator
 
+_jsonl_file_locks: dict[str, asyncio.Lock] = {}
+_jsonl_seen_values: dict[tuple[str, str], set[str]] = {}
+_jsonl_seen_initialized: set[tuple[str, str]] = set()
+
+
 class AsyncFileWriter:
     def __init__(self, platform: str, crawler_type: str):
         self.lock = asyncio.Lock()
@@ -53,11 +58,36 @@ class AsyncFileWriter:
                     await writer.writeheader()
                 await writer.writerow(item)
 
-    async def write_to_jsonl(self, item: Dict, item_type: str):
+    async def write_to_jsonl(self, item: Dict, item_type: str, unique_key: str = "") -> bool:
         file_path = self._get_file_path('jsonl', item_type)
-        async with self.lock:
+        file_lock = _jsonl_file_locks.setdefault(file_path, asyncio.Lock())
+        async with file_lock:
+            identity = str(item.get(unique_key) or "").strip() if unique_key else ""
+            cache_key = (file_path, unique_key)
+            if identity:
+                seen = _jsonl_seen_values.setdefault(cache_key, set())
+                if cache_key not in _jsonl_seen_initialized:
+                    if os.path.exists(file_path) and os.path.getsize(file_path) > 0:
+                        async with aiofiles.open(file_path, 'r', encoding='utf-8') as existing:
+                            async for line in existing:
+                                try:
+                                    stored = json.loads(line)
+                                except json.JSONDecodeError:
+                                    continue
+                                stored_identity = str(stored.get(unique_key) or "").strip()
+                                if stored_identity:
+                                    seen.add(stored_identity)
+                    _jsonl_seen_initialized.add(cache_key)
+                if identity in seen:
+                    utils.logger.info(
+                        f"[AsyncFileWriter.write_to_jsonl] skip duplicate {item_type} {unique_key}={identity}"
+                    )
+                    return False
             async with aiofiles.open(file_path, 'a', encoding='utf-8') as f:
                 await f.write(json.dumps(item, ensure_ascii=False) + '\n')
+            if identity:
+                _jsonl_seen_values[cache_key].add(identity)
+            return True
 
     async def write_single_item_to_json(self, item: Dict, item_type: str):
         file_path = self._get_file_path('json', item_type)

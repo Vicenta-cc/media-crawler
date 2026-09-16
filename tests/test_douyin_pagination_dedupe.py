@@ -7,8 +7,9 @@ import pytest
 
 import config
 from media_platform.douyin.client import DouYinClient
-from media_platform.douyin.core import DouYinCrawler
+from media_platform.douyin.core import DouYinCrawler, reusable_aweme_is_complete
 from media_platform.douyin.exception import DataFetchError
+from tools.async_file_writer import AsyncFileWriter
 
 
 @pytest.mark.asyncio
@@ -41,6 +42,33 @@ async def test_comment_pages_are_deduplicated_by_platform_cid():
     assert [[comment["cid"] for comment in call.args[1]] for call in callback.await_args_list] == [
         ["a", "b"], ["c"]
     ]
+
+
+@pytest.mark.asyncio
+async def test_comment_jsonl_is_idempotent_across_writer_instances(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "SAVE_DATA_PATH", str(tmp_path))
+    first_writer = AsyncFileWriter(platform="douyin", crawler_type="search")
+    resumed_writer = AsyncFileWriter(platform="douyin", crawler_type="search")
+
+    assert await first_writer.write_to_jsonl(
+        {"comment_id": "comment-1", "aweme_id": "post-1"},
+        "comments",
+        unique_key="comment_id",
+    ) is True
+    assert await resumed_writer.write_to_jsonl(
+        {"comment_id": "comment-1", "aweme_id": "post-1"},
+        "comments",
+        unique_key="comment_id",
+    ) is False
+    assert await resumed_writer.write_to_jsonl(
+        {"comment_id": "comment-2", "aweme_id": "post-1"},
+        "comments",
+        unique_key="comment_id",
+    ) is True
+
+    jsonl_path = Path(first_writer._get_file_path("jsonl", "comments"))
+    rows = [json.loads(line) for line in jsonl_path.read_text(encoding="utf-8").splitlines()]
+    assert [row["comment_id"] for row in rows] == ["comment-1", "comment-2"]
 
 
 @pytest.mark.asyncio
@@ -97,6 +125,43 @@ async def test_search_uses_page_size_stride_and_unique_aweme_quota(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_multi_keyword_resume_page_only_applies_to_checkpoint_keyword(monkeypatch):
+    crawler = DouYinCrawler.__new__(DouYinCrawler)
+    offsets = []
+
+    class FakeClient:
+        async def search_info_by_keyword(self, *, keyword, offset, publish_time, search_id):
+            offsets.append((keyword, offset))
+            return {
+                "data": [{"aweme_info": {"aweme_id": f"{keyword}-{offset}"}}],
+                "extra": {"logid": f"log-{keyword}-{offset}"},
+            }
+
+    crawler.dy_client = FakeClient()
+    crawler.wait_for_content_slot = AsyncMock()
+    crawler.get_aweme_media = AsyncMock()
+    crawler.batch_get_note_comments = AsyncMock()
+    monkeypatch.setattr("media_platform.douyin.core.douyin_store.update_douyin_aweme", AsyncMock())
+    for name, value in (
+        ("KEYWORDS", "词一,词二"),
+        ("START_PAGE", 0),
+        ("SEARCH_RESUME_KEYWORD", "词一"),
+        ("SEARCH_RESUME_PAGE", 3),
+        ("STREAM_ITEMS", True),
+        ("CRAWLER_MAX_NOTES_COUNT", 1),
+        ("CRAWLER_MAX_SLEEP_SEC", 0),
+        ("DY_SEARCH_PAGE_SIZE", 15),
+        ("DY_SKIP_AWEME_IDS_FILE", ""),
+        ("DY_REUSABLE_CONTENT_DB", ""),
+    ):
+        monkeypatch.setattr(config, name, value)
+
+    await crawler.search()
+
+    assert offsets == [("词一", 45), ("词二", 0)]
+
+
+@pytest.mark.asyncio
 async def test_search_propagates_api_failure(monkeypatch):
     crawler = DouYinCrawler.__new__(DouYinCrawler)
 
@@ -150,8 +215,16 @@ async def test_search_skips_reusable_aweme_before_detail_media_or_comments(tmp_p
 @pytest.mark.asyncio
 async def test_search_uses_indexed_reusable_content_db(tmp_path, monkeypatch):
     db = tmp_path / "audit.sqlite3"
-    payload_path = tmp_path / "aweme-1.json"
-    payload_path.write_text(json.dumps({"item": {"aweme_id": "1"}}), encoding="utf-8")
+    task_root = tmp_path / "outputs" / "task-a"
+    payload_path = task_root / "raw_items" / "dy_1.json"
+    payload_path.parent.mkdir(parents=True)
+    payload_path.write_text(json.dumps({"item": {
+        "aweme_id": "1", "aweme_url": "https://www.douyin.com/video/1",
+        "note_download_url": "", "video_download_url": "https://cdn/video",
+    }}), encoding="utf-8")
+    video_path = task_root / "crawler" / "douyin" / "videos" / "1" / "video.mp4"
+    video_path.parent.mkdir(parents=True)
+    video_path.write_bytes(b"\x00\x00\x00\x18ftypisomfixture")
     with sqlite3.connect(db) as conn:
         conn.execute("CREATE TABLE contents (platform TEXT, content_key TEXT, collection_status TEXT, raw_item_path TEXT)")
         conn.execute("INSERT INTO contents VALUES ('dy', '1', 'complete', ?)", (str(payload_path),))
@@ -174,3 +247,26 @@ async def test_search_uses_indexed_reusable_content_db(tmp_path, monkeypatch):
 
     crawler.get_aweme_media.assert_awaited_once()
     assert crawler.get_aweme_media.await_args.kwargs["aweme_item"]["aweme_id"] == "2"
+
+
+def test_reusable_aweme_requires_detail_raw_payload_and_intact_media(tmp_path):
+    task_root = tmp_path / "outputs" / "task-a"
+    payload_path = task_root / "raw_items" / "dy_1.json"
+    payload_path.parent.mkdir(parents=True)
+    item = {
+        "aweme_id": "1", "aweme_url": "https://www.douyin.com/video/1",
+        "note_download_url": "", "video_download_url": "https://cdn/video",
+    }
+    payload_path.write_text(json.dumps({"item": item}), encoding="utf-8")
+    video_path = task_root / "crawler" / "douyin" / "videos" / "1" / "video.mp4"
+    video_path.parent.mkdir(parents=True)
+    video_path.write_bytes(b"\x00\x00\x00\x18ftypisomfixture")
+
+    assert reusable_aweme_is_complete(str(payload_path), "1")
+    video_path.write_bytes(b"damaged")
+    assert not reusable_aweme_is_complete(str(payload_path), "1")
+    video_path.write_bytes(b"\x00\x00\x00\x18ftypisomfixture")
+    payload_path.write_text(json.dumps({"item": {"aweme_id": "1"}}), encoding="utf-8")
+    assert not reusable_aweme_is_complete(str(payload_path), "1")
+    payload_path.write_text("{damaged", encoding="utf-8")
+    assert not reusable_aweme_is_complete(str(payload_path), "1")

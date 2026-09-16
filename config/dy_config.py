@@ -28,6 +28,8 @@ DY_REUSABLE_CONTENT_DB = ""
 DY_REQUEST_SCHEDULER_DB = ""
 DY_REQUEST_MIN_INTERVAL = 2.0
 DY_REQUESTS_PER_MINUTE = 30
+DY_REQUEST_CONCURRENCY = 1
+DY_REQUEST_COOLDOWN_SECONDS = 300.0
 
 # Space media GETs and URL refreshes, including fallbacks. No burst on retry.
 DY_MEDIA_REQUEST_INTERVAL = 5.0
@@ -59,3 +61,7 @@ DY_CREATOR_ID_LIST = [
     "MS4wLjABAAAATJPY7LAlaa5X-c8uNdWkvz0jUGgpw4eeXIwu_8BhvqE"
     # ........................
 ]
+
+# Bound creator work even if the platform keeps advertising more pages.
+DY_CREATOR_MAX_PAGES = 1000
+DY_CREATOR_MAX_NO_PROGRESS_PAGES = 3

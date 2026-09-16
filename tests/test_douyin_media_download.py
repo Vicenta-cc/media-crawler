@@ -7,7 +7,7 @@ import pytest
 import config
 from media_platform.douyin import client as client_module
 from media_platform.douyin.core import DouYinCrawler
-from media_platform.douyin.exception import DataFetchError, MediaDownloadError
+from media_platform.douyin.exception import DataFetchError, MediaDownloadError, PlatformRateLimitedError
 from store import douyin as store
 
 
@@ -73,7 +73,6 @@ async def test_failure_and_fake_success_are_not_saved(monkeypatch, status, mime,
     ([MediaDownloadError('403', 403), b'backup'], False, 2, True),
     ([MediaDownloadError('403', 403)] * 2 + [b'fresh'], True, 3, True),
     ([MediaDownloadError('403', 403)] * 4, True, 4, False),
-    ([MediaDownloadError('429', 429)], False, 1, False),
     ([MediaDownloadError('network')] * 2, False, 2, False),
 ])
 async def test_bounded_candidates_refresh_and_rate_limit_stop(
@@ -82,13 +81,15 @@ async def test_bounded_candidates_refresh_and_rate_limit_stop(
     crawler.dy_client = make_client()
     crawler.dy_client.get_aweme_media = AsyncMock(side_effect=outcomes)
     crawler.dy_client.get_video_by_id = AsyncMock(return_value=item('https://cdn/fresh2', 'https://cdn/fresh1'))
-    crawler.dy_client.wait_for_media_slot = AsyncMock()
     sink = AsyncMock()
     monkeypatch.setattr(store, 'update_dy_aweme_video', sink)
-    await crawler.get_aweme_video(item('https://cdn/backup', 'https://cdn/primary'))
+    if saved:
+        await crawler.get_aweme_video(item('https://cdn/backup', 'https://cdn/primary'))
+    else:
+        with pytest.raises(MediaDownloadError, match='media_download_failed'):
+            await crawler.get_aweme_video(item('https://cdn/backup', 'https://cdn/primary'))
     assert crawler.dy_client.get_aweme_media.await_count == downloads
     assert crawler.dy_client.get_video_by_id.await_count == int(refreshed)
-    assert crawler.dy_client.wait_for_media_slot.await_count == int(refreshed)
     assert sink.await_count == int(saved)
 
 
@@ -117,7 +118,8 @@ async def test_refresh_failure_or_opt_out_never_loops(monkeypatch, refresh_enabl
     crawler.dy_client.get_video_by_id = AsyncMock(side_effect=error)
     sink = AsyncMock()
     monkeypatch.setattr(store, 'update_dy_aweme_video', sink)
-    await crawler.get_aweme_video(item('https://cdn/primary'))
+    with pytest.raises(MediaDownloadError, match='media_download_failed'):
+        await crawler.get_aweme_video(item('https://cdn/primary'))
     assert crawler.dy_client.get_aweme_media.await_count == 1
     assert crawler.dy_client.get_video_by_id.await_count == int(refresh_enabled)
     sink.assert_not_called()
@@ -130,7 +132,7 @@ async def test_media_and_refresh_slots_share_spacing(monkeypatch):
     client = make_client()
     loop = asyncio.get_running_loop()
     async def reserve():
-        await client.wait_for_media_slot()
-        return loop.time()
+        async with client._persistent_gate.slot('media'):
+            return loop.time()
     starts = sorted(await asyncio.gather(*(reserve() for _ in range(3))))
     assert all(b - a >= 0.018 for a, b in zip(starts, starts[1:]))

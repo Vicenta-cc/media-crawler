@@ -26,6 +26,41 @@ async def test_cmd_arg_crawler_max_notes_count():
         config.CRAWLER_MAX_NOTES_COUNT = orig_notes
         config.CRAWLER_MAX_COMMENTS_COUNT_SINGLENOTES = orig_comments
 
+
+@pytest.mark.asyncio
+async def test_cmd_arg_shared_request_scheduler_limits():
+    original = {
+        name: getattr(config, name)
+        for name in (
+            "DY_REQUEST_SCHEDULER_DB",
+            "DY_REQUEST_MIN_INTERVAL",
+            "DY_REQUESTS_PER_MINUTE",
+            "DY_REQUEST_CONCURRENCY",
+            "DY_MEDIA_REQUEST_INTERVAL",
+            "DY_REQUEST_COOLDOWN_SECONDS",
+        )
+    }
+
+    try:
+        await parse_cmd([
+            "--platform", "dy",
+            "--request_scheduler_db", "/tmp/douyin-scheduler.sqlite3",
+            "--request_min_interval", "1.5",
+            "--requests_per_minute", "17",
+            "--request_concurrency", "2",
+            "--media_request_interval", "4.5",
+            "--request_cooldown_seconds", "240",
+        ])
+        assert config.DY_REQUEST_SCHEDULER_DB == "/tmp/douyin-scheduler.sqlite3"
+        assert config.DY_REQUEST_MIN_INTERVAL == 1.5
+        assert config.DY_REQUESTS_PER_MINUTE == 17
+        assert config.DY_REQUEST_CONCURRENCY == 2
+        assert config.DY_MEDIA_REQUEST_INTERVAL == 4.5
+        assert config.DY_REQUEST_COOLDOWN_SECONDS == 240
+    finally:
+        for name, value in original.items():
+            setattr(config, name, value)
+
 def test_crawler_manager_build_command():
     cm = CrawlerManager()
 

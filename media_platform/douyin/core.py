@@ -22,7 +22,6 @@ import sqlite3
 import json
 from pathlib import Path
 import os
-import random
 from contextlib import asynccontextmanager
 from asyncio import Task
 from typing import Any, Dict, List, Optional, Tuple
@@ -44,13 +43,57 @@ from store import douyin as douyin_store
 from tools import utils
 from tools.browser_state import has_saved_cookie_state
 from tools.cdp_browser import CDPBrowserManager
+from tools.collection_status import (
+    CollectionIncompleteError,
+    failure_reason,
+    write_collection_status,
+)
 from var import crawler_type_var, source_keyword_var
 
 from .client import DouYinClient
-from .exception import DataFetchError, MediaDownloadError
+from .exception import DataFetchError, MediaDownloadError, PlatformRateLimitedError
 from .field import PublishTimeType
 from .help import parse_video_info_from_url, parse_creator_info_from_url
 from .login import DouYinLogin
+
+
+def reusable_aweme_is_complete(raw_item_path: str, content_key: str) -> bool:
+    """Validate the indexed payload and every media file it promises."""
+    try:
+        path = Path(str(raw_item_path))
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        item = payload.get("item") if isinstance(payload, dict) else None
+        if not isinstance(item, dict) or str(item.get("aweme_id") or "") != str(content_key):
+            return False
+        if not str(item.get("aweme_url") or "").strip():
+            return False
+        if path.parent.name != "raw_items":
+            return False
+        output_root = path.parent.parent
+        note_urls = item.get("note_download_url") or ""
+        if isinstance(note_urls, str):
+            note_urls = [value for value in note_urls.split(",") if value.strip()]
+        elif isinstance(note_urls, list):
+            note_urls = [value for value in note_urls if str(value).strip()]
+        else:
+            return False
+        if note_urls:
+            image_root = output_root / "crawler" / "douyin" / "images" / str(content_key)
+            for index in range(len(note_urls)):
+                media = image_root / f"{index:03d}.jpeg"
+                if not media.is_file() or media.stat().st_size == 0:
+                    return False
+                if media.read_bytes()[:2] != b"\xff\xd8":
+                    return False
+            return True
+        if not str(item.get("video_download_url") or "").strip():
+            return False
+        media = output_root / "crawler" / "douyin" / "videos" / str(content_key) / "video.mp4"
+        if not media.is_file() or media.stat().st_size == 0:
+            return False
+        return b"ftyp" in media.read_bytes()[:32]
+    except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
+        return False
 
 
 class DouYinCrawler(AbstractCrawler):
@@ -211,16 +254,46 @@ class DouYinCrawler(AbstractCrawler):
                 utils.logger.warning(f"[DouYinCrawler.search] cannot open reusable content DB: {exc}")
         if not config.STREAM_ITEMS and config.CRAWLER_MAX_NOTES_COUNT < dy_limit_count:
             config.CRAWLER_MAX_NOTES_COUNT = dy_limit_count
-        start_page = config.START_PAGE  # start page number
-        for keyword in config.KEYWORDS.split(","):
+        start_page = config.START_PAGE  # initial page for each keyword
+        resume_keyword = str(getattr(config, "SEARCH_RESUME_KEYWORD", "") or "").strip()
+        resume_page = int(getattr(config, "SEARCH_RESUME_PAGE", -1))
+        for raw_keyword in config.KEYWORDS.split(","):
+            keyword = raw_keyword.strip()
+            if not keyword:
+                continue
             source_keyword_var.set(keyword)
             utils.logger.info(f"[DouYinCrawler.search] Current keyword: {keyword}")
-            aweme_list: List[str] = []
+            current_task_ids: set[str] = set()
+            current_task_id = str(getattr(config, "CURRENT_TASK_ID", "") or "").strip()
+            if reusable_conn and current_task_id:
+                try:
+                    rows = reusable_conn.execute(
+                        "SELECT c.content_key, c.raw_item_path "
+                        "FROM contents c JOIN content_matches m ON m.content_id = c.id "
+                        "WHERE c.platform='dy' AND c.collection_status='complete' "
+                        "AND m.task_id=? AND m.keyword=?",
+                        (current_task_id, keyword),
+                    ).fetchall()
+                    for content_key, raw_item_path in rows:
+                        if reusable_aweme_is_complete(raw_item_path, content_key):
+                            current_task_ids.add(str(content_key))
+                except sqlite3.Error as exc:
+                    utils.logger.warning(f"[DouYinCrawler.search] current task lookup failed: {exc}")
+            aweme_list: List[str] = sorted(current_task_ids)
+            if aweme_list:
+                utils.logger.info(
+                    f"[DouYinCrawler.search] resume task with {len(aweme_list)} complete awemes"
+                )
             seen_aweme_ids: set[str] = set()
+            keyword_start_page = (
+                max(start_page, resume_page)
+                if resume_keyword and keyword == resume_keyword and resume_page >= 0
+                else start_page
+            )
             page = 0
             dy_search_id = ""
             while len(aweme_list) < config.CRAWLER_MAX_NOTES_COUNT:
-                if page < start_page:
+                if page < keyword_start_page:
                     utils.logger.info(f"[DouYinCrawler.search] Skip {page}")
                     page += 1
                     continue
@@ -268,13 +341,8 @@ class DouYinCrawler(AbstractCrawler):
                             page_ids,
                         ).fetchall()
                         for content_key, raw_item_path in rows:
-                            try:
-                                payload = json.loads(Path(str(raw_item_path)).read_text(encoding="utf-8"))
-                                item = payload.get("item") if isinstance(payload, dict) else None
-                                if isinstance(item, dict) and str(item.get("aweme_id") or "") == str(content_key):
-                                    skip_aweme_ids.add(str(content_key))
-                            except (OSError, UnicodeError, json.JSONDecodeError, TypeError):
-                                continue
+                            if reusable_aweme_is_complete(raw_item_path, content_key):
+                                skip_aweme_ids.add(str(content_key))
                     except sqlite3.Error as exc:
                         utils.logger.warning(f"[DouYinCrawler.search] reusable DB lookup failed: {exc}")
                 for post_item in posts_res.get("data"):
@@ -299,8 +367,8 @@ class DouYinCrawler(AbstractCrawler):
                         await douyin_store.update_douyin_aweme(aweme_item=aweme_info)
                     else:
                         page_aweme_list.append(aweme_info.get("aweme_id", ""))
-                        await douyin_store.update_douyin_aweme(aweme_item=aweme_info)
                         await self.get_aweme_media(aweme_item=aweme_info)
+                        await douyin_store.update_douyin_aweme(aweme_item=aweme_info)
                 
                 # Batch get note comments for the current page
                 if not config.STREAM_ITEMS:
@@ -353,16 +421,45 @@ class DouYinCrawler(AbstractCrawler):
         async with self.content_request_slot(semaphore, aweme_id):
             try:
                 result = await self.dy_client.get_video_by_id(aweme_id)
+                if not isinstance(result, dict) or str(result.get("aweme_id") or "") != str(aweme_id):
+                    raise CollectionIncompleteError(
+                        "COLLECTION_INCOMPLETE: missing_or_mismatched_detail"
+                    )
                 # Sleep after fetching aweme detail
                 await asyncio.sleep(config.CRAWLER_MAX_SLEEP_SEC)
                 utils.logger.info(f"[DouYinCrawler.get_aweme_detail] Sleeping for {config.CRAWLER_MAX_SLEEP_SEC} seconds after fetching aweme {aweme_id}")
+                write_collection_status(aweme_id, "detail", "complete")
                 return result
+            except asyncio.CancelledError as ex:
+                write_collection_status(
+                    aweme_id, "detail", "interrupted", reason=failure_reason(ex)
+                )
+                raise
+            except PlatformRateLimitedError as ex:
+                write_collection_status(
+                    aweme_id, "detail", "interrupted", reason=failure_reason(ex)
+                )
+                raise
             except DataFetchError as ex:
                 utils.logger.error(f"[DouYinCrawler.get_aweme_detail] Get aweme detail error: {ex}")
-                return None
-            except KeyError as ex:
+                write_collection_status(
+                    aweme_id, "detail", "failed", reason=failure_reason(ex)
+                )
+                if "ACCOUNT_VERIFY" in str(ex) or "ACCOUNT_AUTH_INVALID" in str(ex):
+                    raise
+                raise CollectionIncompleteError(
+                    f"COLLECTION_INCOMPLETE: {failure_reason(ex)}"
+                ) from ex
+            except (KeyError, CollectionIncompleteError) as ex:
                 utils.logger.error(f"[DouYinCrawler.get_aweme_detail] have not fund note detail aweme_id:{aweme_id}, err: {ex}")
-                return None
+                write_collection_status(
+                    aweme_id, "detail", "failed", reason=failure_reason(ex)
+                )
+                if isinstance(ex, CollectionIncompleteError):
+                    raise
+                raise CollectionIncompleteError(
+                    "COLLECTION_INCOMPLETE: missing_or_mismatched_detail"
+                ) from ex
 
     async def batch_get_note_comments(self, aweme_list: List[str]) -> None:
         """
@@ -440,22 +537,18 @@ class DouYinCrawler(AbstractCrawler):
         """
         if config.STREAM_ITEMS:
             semaphore = asyncio.Semaphore(config.MAX_CONCURRENCY_NUM)
-            task_list = [
-                self.process_creator_aweme_stream_item(post_item, semaphore)
-                for post_item in video_list
-            ]
-            if task_list:
-                await asyncio.gather(*task_list)
+            # Commit each fully collected item before starting the next one.  A
+            # later failure therefore preserves earlier successes without
+            # starting work that cannot be accounted for after the exception.
+            for post_item in video_list:
+                await self.process_creator_aweme_stream_item(post_item, semaphore)
             return
 
         semaphore = asyncio.Semaphore(config.MAX_CONCURRENCY_NUM)
-        task_list = [self.get_aweme_detail(post_item.get("aweme_id"), semaphore) for post_item in video_list]
-
-        note_details = await asyncio.gather(*task_list)
-        for aweme_item in note_details:
-            if aweme_item is not None:
-                await douyin_store.update_douyin_aweme(aweme_item=aweme_item)
-                await self.get_aweme_media(aweme_item=aweme_item)
+        for post_item in video_list:
+            aweme_item = await self.get_aweme_detail(post_item.get("aweme_id"), semaphore)
+            await self.get_aweme_media(aweme_item=aweme_item)
+            await douyin_store.update_douyin_aweme(aweme_item=aweme_item)
 
     async def process_creator_aweme_stream_item(self, post_item: Dict, semaphore: asyncio.Semaphore) -> None:
         """Process one creator aweme fully, then persist it for streaming consumers."""
@@ -464,9 +557,6 @@ class DouYinCrawler(AbstractCrawler):
             return
 
         aweme_item = await self.get_aweme_detail(aweme_id, semaphore)
-        if aweme_item is None:
-            aweme_item = post_item
-
         await self.get_aweme_media(aweme_item=aweme_item)
         await self.batch_get_note_comments([aweme_id])
         await douyin_store.update_douyin_aweme(aweme_item=aweme_item)
@@ -574,15 +664,34 @@ class DouYinCrawler(AbstractCrawler):
         if not config.ENABLE_GET_MEIDAS:
             utils.logger.info(f"[DouYinCrawler.get_aweme_media] Crawling image mode is not enabled")
             return
+        aweme_id = str(aweme_item.get("aweme_id") or "")
         # List of note urls. If it is a short video type, an empty list will be returned.
         note_download_url: List[str] = douyin_store._extract_note_image_list(aweme_item)
-        # The video URL will always exist, but when it is a short video type, the file is actually an audio file.
-        video_download_url: str = douyin_store._extract_video_download_url(aweme_item)
-        # TODO: Douyin does not adopt the audio and video separation strategy, so the audio can be separated from the original video and will not be extracted for the time being.
-        if note_download_url:
-            await self.get_aweme_images(aweme_item)
-        else:
-            await self.get_aweme_video(aweme_item)
+        try:
+            if note_download_url:
+                await self.get_aweme_images(aweme_item)
+            else:
+                await self.get_aweme_video(aweme_item)
+        except asyncio.CancelledError as ex:
+            write_collection_status(
+                aweme_id, "media", "interrupted", reason=failure_reason(ex)
+            )
+            raise
+        except (PlatformRateLimitedError, DataFetchError) as ex:
+            write_collection_status(
+                aweme_id, "media", "interrupted", reason=failure_reason(ex)
+            )
+            raise
+        except CollectionIncompleteError:
+            raise
+        except (MediaDownloadError, KeyError, TypeError, ValueError) as ex:
+            write_collection_status(
+                aweme_id, "media", "failed", reason=failure_reason(ex)
+            )
+            raise CollectionIncompleteError(
+                f"COLLECTION_INCOMPLETE: {failure_reason(ex)}"
+            ) from ex
+        write_collection_status(aweme_id, "media", "complete")
 
     async def get_aweme_images(self, aweme_item: Dict):
         """
@@ -599,17 +708,34 @@ class DouYinCrawler(AbstractCrawler):
 
         if not note_download_url:
             return
-        picNum = 0
-        for url in note_download_url:
+        failed_indices = []
+        succeeded = 0
+        for source_index, url in enumerate(note_download_url):
             if not url:
+                failed_indices.append(source_index)
                 continue
-            content = await self.dy_client.get_aweme_media(url)
-            await asyncio.sleep(random.random())
-            if content is None:
+            try:
+                content = await self.dy_client.get_aweme_media(url, raise_on_error=True)
+            except MediaDownloadError:
+                failed_indices.append(source_index)
                 continue
-            extension_file_name = f"{picNum:>03d}.jpeg"
-            picNum += 1
+            if not content:
+                failed_indices.append(source_index)
+                continue
+            extension_file_name = f"{source_index:>03d}.jpeg"
             await douyin_store.update_dy_aweme_image(aweme_id, content, extension_file_name)
+            succeeded += 1
+        if failed_indices:
+            write_collection_status(
+                aweme_id,
+                "media",
+                "failed",
+                reason="incomplete_images",
+                expected=len(note_download_url),
+                succeeded=succeeded,
+                failed_indices=failed_indices,
+            )
+            raise CollectionIncompleteError("COLLECTION_INCOMPLETE: incomplete_images")
 
     async def get_aweme_video(self, aweme_item: Dict):
         """
@@ -625,7 +751,7 @@ class DouYinCrawler(AbstractCrawler):
         # The video URL will always exist, but when it is a short video type, the file is actually an audio file.
         urls = douyin_store._extract_video_download_urls(aweme_item)
         if not urls:
-            return
+            raise MediaDownloadError("missing_video_url")
         limit = max(1, min(3, int(config.DY_MEDIA_MAX_URL_ATTEMPTS)))
         for generation in range(2):
             refresh_needed = False
@@ -634,8 +760,9 @@ class DouYinCrawler(AbstractCrawler):
                     content = await self.dy_client.get_aweme_media(url, raise_on_error=True)
                 except MediaDownloadError as exc:
                     if exc.status_code == 429:
-                        utils.logger.warning(f"[DouYinCrawler.get_aweme_video] post={aweme_id} media_rate_limited")
-                        return
+                        raise PlatformRateLimitedError(
+                            "PLATFORM_RATE_LIMITED: media HTTP 429"
+                        ) from exc
                     refresh_needed |= exc.status_code in {403, 410}
                     continue
                 if content:
@@ -644,11 +771,20 @@ class DouYinCrawler(AbstractCrawler):
             if generation or not refresh_needed or not config.DY_MEDIA_REFRESH_ON_FAILURE:
                 break
             # Refresh only after candidate exhaustion, at most once. Reuse the same account.
-            await self.dy_client.wait_for_media_slot()
             try:
-                fresh = await self.dy_client.get_video_by_id(aweme_id)
+                fresh = await self.dy_client.get_video_by_id(
+                    aweme_id, operation="media_refresh"
+                )
+            except PlatformRateLimitedError:
+                raise
+            except DataFetchError as ex:
+                utils.logger.warning(f"[DouYinCrawler.get_aweme_video] post={aweme_id} refresh_failed")
+                if "ACCOUNT_VERIFY" in str(ex) or "ACCOUNT_AUTH_INVALID" in str(ex):
+                    raise
+                break
             except httpx.HTTPError:
                 utils.logger.warning(f"[DouYinCrawler.get_aweme_video] post={aweme_id} refresh_failed")
                 break
             urls = douyin_store._extract_video_download_urls(fresh or {})
         utils.logger.warning(f"[DouYinCrawler.get_aweme_video] post={aweme_id} media_download_failed")
+        raise MediaDownloadError("media_download_failed")

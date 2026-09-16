@@ -106,6 +106,11 @@ DY_CLOAK_PROFILE_ROOT = "browser_data/cloakbrowser"
 # The number of pages to start crawling starts from the first page by default
 START_PAGE = 1
 
+# Optional per-keyword resume boundary. START_PAGE remains the initial page for
+# every other keyword in the same search task.
+SEARCH_RESUME_KEYWORD = ""
+SEARCH_RESUME_PAGE = -1
+
 # Control the number of crawled videos/posts
 CRAWLER_MAX_NOTES_COUNT = 15
 

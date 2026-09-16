@@ -35,3 +35,7 @@ class MediaDownloadError(Exception):
     def __init__(self, reason: str, status_code: int | None = None):
         super().__init__(reason)
         self.status_code = status_code
+
+
+class PlatformRateLimitedError(DataFetchError):
+    """Platform-wide cooldown: propagate without account rotation or media fallback."""

@@ -220,7 +220,8 @@ class DouyinJsonlStoreImplement(AbstractStore):
     async def store_comment(self, comment_item: Dict):
         await self.file_writer.write_to_jsonl(
             item=comment_item,
-            item_type="comments"
+            item_type="comments",
+            unique_key="comment_id",
         )
 
     async def store_creator(self, creator: Dict):

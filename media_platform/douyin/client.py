@@ -21,6 +21,7 @@ import asyncio
 import copy
 import json
 import time
+from email.utils import parsedate_to_datetime
 import urllib.parse
 from typing import TYPE_CHECKING, Any, Callable, Dict, Union, Optional
 
@@ -32,7 +33,7 @@ from base.base_crawler import AbstractApiClient
 from proxy.proxy_mixin import ProxyRefreshMixin
 from tools import utils
 from tools.httpx_util import make_async_client
-from tools.persistent_request_gate import PersistentRequestGate
+from tools.persistent_request_gate import configured_gate
 from var import request_keyword_var
 
 if TYPE_CHECKING:
@@ -78,15 +79,13 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
         ]
         self.playwright_page = playwright_page
         self.cookie_dict = cookie_dict
-        self._media_lock = asyncio.Lock()
-        self._next_media_request = 0.0
-        gate_db = str(getattr(config, "DY_REQUEST_SCHEDULER_DB", "") or "").strip()
-        self._persistent_gate = (
-            PersistentRequestGate(
-                gate_db,
-                min_interval=float(getattr(config, "DY_REQUEST_MIN_INTERVAL", 2.0)),
-                per_minute=int(getattr(config, "DY_REQUESTS_PER_MINUTE", 30)),
-            ) if gate_db else None
+        self._persistent_gate = configured_gate(
+            db_path=config.DY_REQUEST_SCHEDULER_DB,
+            min_interval=config.DY_REQUEST_MIN_INTERVAL,
+            per_minute=config.DY_REQUESTS_PER_MINUTE,
+            max_concurrency=config.DY_REQUEST_CONCURRENCY,
+            media_interval=config.DY_MEDIA_REQUEST_INTERVAL,
+            cooldown_seconds=config.DY_REQUEST_COOLDOWN_SECONDS,
         )
         # Initialize proxy pool (from ProxyRefreshMixin)
         self.init_proxy_pool(proxy_ip_pool)
@@ -181,14 +180,45 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
         control_text = json.dumps(control_values, ensure_ascii=False).lower()
         return any(marker in control_text for marker in cls._VERIFICATION_MARKERS)
 
-    async def request(self, method, url, **kwargs):
-        if self._persistent_gate:
-            await self._persistent_gate.acquire()
-        # Check whether the proxy has expired before each request
+    async def _send(self, method, url, *, operation='api', timeout=None, follow_redirects=False, **kwargs):
+        # Prepare the client/proxy before acquiring a slot; no second pacing wait
+        # may separate the shared reservation from the actual transport call.
         await self._refresh_proxy_if_expired()
+        timeout = self.timeout if timeout is None else timeout
+        async with make_async_client(proxy=self.proxy, follow_redirects=False) as client:
+            for hop in range(11):
+                async with self._persistent_gate.slot(operation, timeout=timeout) as waited:
+                    utils.logger.info(f"REQUEST_SCHEDULER operation={operation} waited_seconds={waited:.3f}")
+                    response = await client.request(method, url, timeout=timeout, follow_redirects=False, **kwargs)
+                    if response.status_code == 429:
+                        raw = response.headers.get('Retry-After', '')
+                        try:
+                            seconds = float(raw)
+                        except ValueError:
+                            try:
+                                seconds = parsedate_to_datetime(raw).timestamp() - time.time()
+                            except (TypeError, ValueError, OverflowError):
+                                seconds = 0
+                        # Malformed values cannot clear the default shared cooldown.
+                        if not __import__('math').isfinite(seconds):
+                            seconds = 0
+                        seconds = max(self._persistent_gate.state.cooldown_seconds, seconds)
+                        self._persistent_gate.state.enter_cooldown('HTTP 429', seconds)
+                        raise PlatformRateLimitedError('PLATFORM_RATE_LIMITED: HTTP 429; shared cooldown recorded')
+                if not follow_redirects or response.status_code not in (301, 302, 303, 307, 308):
+                    return response
+                if hop == 10:
+                    raise httpx.TooManyRedirects('media redirect limit exceeded')
+                location = response.headers.get('Location')
+                if not location:
+                    return response
+                url = urllib.parse.urljoin(str(response.url), location)
+                if urllib.parse.urlsplit(url).scheme not in ('http', 'https'):
+                    raise httpx.InvalidURL('unsupported redirect scheme')
+        raise RuntimeError('unreachable')
 
-        async with make_async_client(proxy=self.proxy) as client:
-            response = await client.request(method, url, timeout=self.timeout, **kwargs)
+    async def request(self, method, url, **kwargs):
+        response = await self._send(method, url, **kwargs)
 
         try:
             payload = response.json()
@@ -204,13 +234,13 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
             raise DataFetchError("platform response is empty or not valid JSON")
         return payload
 
-    async def get(self, uri: str, params: Optional[Dict] = None, headers: Optional[Dict] = None):
+    async def get(self, uri: str, params: Optional[Dict] = None, headers: Optional[Dict] = None, *, operation="api"):
         """
         GET请求
         """
         await self.__process_req_params(uri, params, headers)
         headers = headers or self.headers
-        return await self.request(method="GET", url=f"{self._host}{uri}", params=params, headers=headers)
+        return await self.request(method="GET", url=f"{self._host}{uri}", params=params, headers=headers, operation=operation)
 
     async def post(self, uri: str, data: dict, headers: Optional[Dict] = None):
         await self.__process_req_params(uri, data, headers)
@@ -278,7 +308,7 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
         headers["Referer"] = urllib.parse.quote(referer_url, safe=':/')
         return await self.get("/aweme/v1/web/general/search/single/", query_params, headers=headers)
 
-    async def get_video_by_id(self, aweme_id: str) -> Any:
+    async def get_video_by_id(self, aweme_id: str, *, operation="api") -> Any:
         """
         DouYin Video Detail API
         :param aweme_id:
@@ -287,7 +317,7 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
         params = {"aweme_id": aweme_id}
         headers = copy.copy(self.headers)
         del headers["Origin"]
-        res = await self.get("/aweme/v1/web/aweme/detail/", params, headers)
+        res = await self.get("/aweme/v1/web/aweme/detail/", params, headers, operation=operation)
         return res.get("aweme_detail", {})
 
     async def get_aweme_comments(self, aweme_id: str, cursor: int = 0):
@@ -331,7 +361,7 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
         """
         获取帖子的所有评论，包括子评论
         :param aweme_id: 帖子ID
-        :param crawl_interval: 抓取间隔
+        :param crawl_interval: 兼容旧调用；请求节奏由共享调度器控制，此参数不再增加等待
         :param is_fetch_sub_comments: 是否抓取子评论
         :param callback: 回调函数，用于处理抓取到的评论
         :param max_count: 一次帖子爬取的最大评论数量
@@ -342,7 +372,11 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
         comments_has_more = 1
         comments_cursor = 0
         previous_cursor = None
+        seen_cursors = set()
         while comments_has_more and len(result) < max_count:
+            if comments_cursor in seen_cursors:
+                raise DataFetchError("COLLECTION_INCOMPLETE: comment_pagination_stalled")
+            seen_cursors.add(comments_cursor)
             comments_res = await self.get_aweme_comments(aweme_id, comments_cursor)
             comments_has_more = comments_res.get("has_more", 0)
             next_cursor = comments_res.get("cursor", 0)
@@ -364,7 +398,6 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
             if callback:  # If there is a callback function, execute the callback function
                 await callback(aweme_id, comments)
 
-            await asyncio.sleep(crawl_interval)
             previous_cursor, comments_cursor = comments_cursor, next_cursor
             if comments_cursor == previous_cursor and comments_has_more:
                 break
@@ -372,14 +405,20 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
                 continue
             # Get secondary reviews
             for comment in comments:
-                reply_comment_total = comment.get("reply_comment_total")
+                if len(result) >= max_count:
+                    break
+                reply_comment_total = comment.get("reply_comment_total") or 0
 
                 if reply_comment_total > 0:
                     comment_id = comment.get("cid")
                     sub_comments_has_more = 1
                     sub_comments_cursor = 0
+                    seen_sub_cursors = set()
 
-                    while sub_comments_has_more:
+                    while sub_comments_has_more and len(result) < max_count:
+                        if sub_comments_cursor in seen_sub_cursors:
+                            raise DataFetchError("COLLECTION_INCOMPLETE: subcomment_pagination_stalled")
+                        seen_sub_cursors.add(sub_comments_cursor)
                         sub_comments_res = await self.get_sub_comments(aweme_id, comment_id, sub_comments_cursor)
                         sub_comments_has_more = sub_comments_res.get("has_more", 0)
                         next_sub_comments_cursor = sub_comments_res.get("cursor", 0)
@@ -399,7 +438,6 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
                         result.extend(sub_comments)
                         if callback:  # If there is a callback function, execute the callback function
                             await callback(aweme_id, sub_comments)
-                        await asyncio.sleep(crawl_interval)
                         if next_sub_comments_cursor == sub_comments_cursor and sub_comments_has_more:
                             break
                         sub_comments_cursor = next_sub_comments_cursor
@@ -437,32 +475,40 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
         return await self.get(uri, params)
 
     async def get_all_user_aweme_posts(self, sec_user_id: str, callback: Optional[Callable] = None):
-        posts_has_more = 1
-        max_cursor = ""
         result = []
-        while posts_has_more == 1 and len(result) < config.CRAWLER_MAX_NOTES_COUNT:
-            aweme_post_res = await self.get_user_aweme_posts(sec_user_id, max_cursor)
-            posts_has_more = aweme_post_res.get("has_more", 0)
-            max_cursor = aweme_post_res.get("max_cursor")
-            aweme_list = aweme_post_res.get("aweme_list") if aweme_post_res.get("aweme_list") else []
-            remaining = config.CRAWLER_MAX_NOTES_COUNT - len(result)
-            aweme_list = aweme_list[:remaining]
-            utils.logger.info(f"[DouYinClient.get_all_user_aweme_posts] get sec_user_id:{sec_user_id} video len : {len(aweme_list)}")
-            if callback:
-                await callback(aweme_list)
-            result.extend(aweme_list)
-        return result
-
-    async def wait_for_media_slot(self):
-        async with self._media_lock:
-            await asyncio.sleep(max(0.0, self._next_media_request - time.monotonic()))
-            interval = max(0.0, float(config.DY_MEDIA_REQUEST_INTERVAL))
-            self._next_media_request = time.monotonic() + interval
+        seen_ids = set()
+        seen_cursors = set()
+        cursor = ''
+        no_progress = 0
+        page_limit = max(1, int(config.DY_CREATOR_MAX_PAGES))
+        for _ in range(page_limit):
+            if len(result) >= config.CRAWLER_MAX_NOTES_COUNT:
+                return result
+            seen_cursors.add(str(cursor))
+            page = await self.get_user_aweme_posts(sec_user_id, cursor)
+            if not isinstance(page, dict) or 'has_more' not in page or 'aweme_list' not in page or not isinstance(page['aweme_list'], (list, type(None))):
+                raise DataFetchError('COLLECTION_INCOMPLETE: invalid_creator_page')
+            unique = []
+            for item in page.get('aweme_list') or []:
+                content_id = str(item.get('aweme_id') or '')
+                if not content_id or content_id in seen_ids:
+                    continue
+                seen_ids.add(content_id)
+                unique.append(item)
+            unique = unique[:config.CRAWLER_MAX_NOTES_COUNT - len(result)]
+            if unique and callback:
+                await callback(unique)
+            result.extend(unique)
+            if not page.get('has_more') or len(result) >= config.CRAWLER_MAX_NOTES_COUNT:
+                return result
+            no_progress = 0 if unique else no_progress + 1
+            next_cursor = page.get('max_cursor')
+            if next_cursor is None or str(next_cursor) in seen_cursors or no_progress >= config.DY_CREATOR_MAX_NO_PROGRESS_PAGES:
+                raise DataFetchError('COLLECTION_INCOMPLETE: creator_pagination_stalled')
+            cursor = next_cursor
+        raise DataFetchError('COLLECTION_INCOMPLETE: creator_page_budget_exceeded')
 
     async def get_aweme_media(self, url: str, *, raise_on_error: bool = False) -> Union[bytes, None]:
-        if self._persistent_gate:
-            await self._persistent_gate.acquire()
-        await self.wait_for_media_slot()
         # Do not forward API Host, Cookie or Authorization to another CDN domain.
         headers = {"Referer": "https://www.douyin.com/"}
         if self.headers.get("User-Agent"):
@@ -470,9 +516,8 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
         host = urllib.parse.urlsplit(url).hostname
         final_host = host
         try:
-            async with make_async_client(proxy=self.proxy) as client:
-                response = await client.request("GET", url, headers=headers,
-                                                timeout=self.timeout, follow_redirects=True)
+            response = await self._send("GET", url, operation='media', headers=headers,
+                                        timeout=self.timeout, follow_redirects=True)
             final_host = response.url.host
             if response.status_code != 200:
                 raise MediaDownloadError("media_http_error", response.status_code)
@@ -482,6 +527,8 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
             }:
                 raise MediaDownloadError("invalid_media_response", response.status_code)
             return response.content
+        except PlatformRateLimitedError:
+            raise
         except (httpx.HTTPError, MediaDownloadError) as exc:
             status = getattr(exc, "status_code", None)
             # Signed URLs, cookies and response bodies never go into failure logs.
@@ -503,19 +550,13 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
         Returns:
             重定向后的完整URL
         """
-        async with make_async_client(proxy=self.proxy, follow_redirects=False) as client:
-            try:
-                utils.logger.info(f"[DouYinClient.resolve_short_url] Resolving short URL: {short_url}")
-                response = await client.get(short_url, timeout=10)
-
-                # Short links usually return a 302 redirect
-                if response.status_code in [301, 302, 303, 307, 308]:
-                    redirect_url = response.headers.get("Location", "")
-                    utils.logger.info(f"[DouYinClient.resolve_short_url] Resolved to: {redirect_url}")
-                    return redirect_url
-                else:
-                    utils.logger.warning(f"[DouYinClient.resolve_short_url] Unexpected status code: {response.status_code}")
-                    return ""
-            except Exception as e:
-                utils.logger.error(f"[DouYinClient.resolve_short_url] Failed to resolve short URL: {e}")
-                return ""
+        try:
+            response = await self._send('GET', short_url, operation='short_url', timeout=10)
+            if response.status_code in (301, 302, 303, 307, 308):
+                return urllib.parse.urljoin(short_url, response.headers.get('Location', ''))
+            return ''
+        except PlatformRateLimitedError:
+            raise
+        except httpx.HTTPError:
+            utils.logger.warning('[DouYinClient.resolve_short_url] request failed')
+            return ''
