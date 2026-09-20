@@ -2,7 +2,7 @@
 
 当前 R2 配套爬虫提交：`efafe3186400b1020955c6acfdc201235b84a2d8`；冻结分支 `codex/douyin-v2-pagination-dedupe-20260914`；标签 `douyin-pagination-fix-20260916`。
 
-配套应用提交：`509d922af4d23dec9d488e7f1e3b95042b0c4bf1`，见 [audit-agent-demo](https://github.com/Vicenta-cc/audit-agent-demo/tree/codex/r2-interactive-login-20260918)。本 README 更新在独立文档分支 `codex/r2-frozen-handoff-20260920`，不改变冻结分支和线上代码。
+配套应用提交：`509d922af4d23dec9d488e7f1e3b95042b0c4bf1`，见 [audit-agent-demo](https://github.com/Vicenta-cc/audit-agent-demo/tree/codex/r2-interactive-login-20260918)。`main` 已同步冻结代码与本 README，原 main 历史继续保留；文档另存于 `codex/r2-frozen-handoff-20260920`。冻结分支、标签和线上代码保持不变。
 
 **R2 集成请先阅读 [冻结版本与启动说明](docs/R2-FROZEN-BASELINE-20260920.md)**。抖音使用账号绑定的持久化 CloakBrowser Profile，不能直接套用下文上游通用 CDP 登录说明。应用用户系统与平台采集账号是不同概念。
 
