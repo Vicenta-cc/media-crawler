@@ -52,7 +52,7 @@ from var import crawler_type_var, source_keyword_var
 
 from .client import DouYinClient
 from .exception import DataFetchError, MediaDownloadError, PlatformRateLimitedError
-from .field import PublishTimeType
+from .field import PublishTimeType, SearchSortType
 from .help import parse_video_info_from_url, parse_creator_info_from_url
 from .login import DouYinLogin
 
@@ -309,11 +309,21 @@ class DouYinCrawler(AbstractCrawler):
                 requested_pages += 1
                 try:
                     utils.logger.info(f"[DouYinCrawler.search] search douyin keyword: {keyword}, page: {page}")
+                    search_kwargs = {
+                        "keyword": keyword,
+                        "offset": page * dy_limit_count,
+                        "publish_time": PublishTimeType(config.PUBLISH_TIME_TYPE),
+                        "search_id": dy_search_id,
+                    }
+                    search_sort = {
+                        "general": SearchSortType.GENERAL,
+                        "most_liked": SearchSortType.MOST_LIKE,
+                        "latest": SearchSortType.LATEST,
+                    }.get(str(config.DY_SEARCH_SORT), SearchSortType.GENERAL)
+                    if search_sort is not SearchSortType.GENERAL:
+                        search_kwargs["sort_type"] = search_sort
                     posts_res = await self.dy_client.search_info_by_keyword(
-                        keyword=keyword,
-                        offset=page * dy_limit_count,
-                        publish_time=PublishTimeType(config.PUBLISH_TIME_TYPE),
-                        search_id=dy_search_id,
+                        **search_kwargs,
                     )
                     if posts_res.get("data") is None or posts_res.get("data") == []:
                         utils.logger.info(f"[DouYinCrawler.search] search douyin keyword: {keyword}, page: {page} is empty,{posts_res.get('data')}`")

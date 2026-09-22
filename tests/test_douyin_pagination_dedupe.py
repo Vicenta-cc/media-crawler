@@ -9,6 +9,7 @@ import config
 from media_platform.douyin.client import DouYinClient
 from media_platform.douyin.core import DouYinCrawler, reusable_aweme_is_complete
 from media_platform.douyin.exception import DataFetchError
+from media_platform.douyin.field import SearchSortType
 from tools.async_file_writer import AsyncFileWriter
 
 
@@ -335,6 +336,42 @@ async def test_search_propagates_api_failure(monkeypatch):
 
     with pytest.raises(DataFetchError, match="ACCOUNT_VERIFY"):
         await crawler.search()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("configured", "expected"),
+    [
+        ("most_liked", SearchSortType.MOST_LIKE),
+        ("latest", SearchSortType.LATEST),
+    ],
+)
+async def test_search_passes_configured_sort_to_douyin_api(monkeypatch, configured, expected):
+    crawler = DouYinCrawler.__new__(DouYinCrawler)
+    calls = []
+
+    class FakeClient:
+        async def search_info_by_keyword(self, **kwargs):
+            calls.append(kwargs)
+            return {"data": []}
+
+    crawler.dy_client = FakeClient()
+    for name, value in (
+        ("KEYWORDS", "keyword"),
+        ("START_PAGE", 0),
+        ("STREAM_ITEMS", True),
+        ("CRAWLER_MAX_NOTES_COUNT", 1),
+        ("CRAWLER_MAX_SLEEP_SEC", 0),
+        ("DY_SEARCH_PAGE_SIZE", 15),
+        ("DY_SKIP_AWEME_IDS_FILE", ""),
+        ("DY_REUSABLE_CONTENT_DB", ""),
+        ("DY_SEARCH_SORT", configured),
+    ):
+        monkeypatch.setattr(config, name, value)
+
+    await crawler.search()
+
+    assert calls[0]["sort_type"] is expected
 
 
 @pytest.mark.asyncio

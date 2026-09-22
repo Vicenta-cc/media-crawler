@@ -28,6 +28,22 @@ async def test_cmd_arg_crawler_max_notes_count():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("value", ["general", "most_liked", "latest"])
+async def test_cmd_arg_douyin_search_sort(value):
+    original = config.DY_SEARCH_SORT
+    try:
+        result = await parse_cmd([
+            "--platform", "dy",
+            "--type", "search",
+            "--dy_search_sort", value,
+        ])
+        assert config.DY_SEARCH_SORT == value
+        assert result.dy_search_sort == value
+    finally:
+        config.DY_SEARCH_SORT = original
+
+
+@pytest.mark.asyncio
 async def test_cmd_arg_shared_request_scheduler_limits():
     original = {
         name: getattr(config, name)
