@@ -1,7 +1,7 @@
 import pytest
 
 import config
-from tests.test_douyin_response_detection import install_response, make_client
+from tests.test_douyin_response_detection import make_client
 
 
 @pytest.mark.asyncio
