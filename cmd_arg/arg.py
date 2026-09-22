@@ -65,6 +65,14 @@ class CrawlerTypeEnum(str, Enum):
     CREATOR = "creator"
 
 
+class DouyinSearchSortEnum(str, Enum):
+    """Supported Douyin keyword-search sorting modes."""
+
+    GENERAL = "general"
+    MOST_LIKED = "most_liked"
+    LATEST = "latest"
+
+
 class SaveDataOptionEnum(str, Enum):
     """Data save option enumeration"""
 
@@ -202,6 +210,18 @@ async def parse_cmd(argv: Optional[Sequence[str]] = None):
                 rich_help_panel="Basic Configuration",
             ),
         ] = config.KEYWORDS,
+        dy_search_sort: Annotated[
+            DouyinSearchSortEnum,
+            typer.Option(
+                "--dy_search_sort",
+                help="Douyin keyword search order (general | most_liked | latest)",
+                rich_help_panel="Basic Configuration",
+            ),
+        ] = _coerce_enum(
+            DouyinSearchSortEnum,
+            config.DY_SEARCH_SORT,
+            DouyinSearchSortEnum.GENERAL,
+        ),
         get_comment: Annotated[
             str,
             typer.Option(
@@ -456,6 +476,7 @@ async def parse_cmd(argv: Optional[Sequence[str]] = None):
         config.CRAWLER_TYPE = crawler_type.value
         config.START_PAGE = start
         config.KEYWORDS = keywords
+        config.DY_SEARCH_SORT = dy_search_sort.value
         config.ENABLE_GET_COMMENTS = enable_comment
         config.ENABLE_GET_SUB_COMMENTS = enable_sub_comment
         config.ENABLE_GET_MEIDAS = enable_media
@@ -530,6 +551,7 @@ async def parse_cmd(argv: Optional[Sequence[str]] = None):
             type=config.CRAWLER_TYPE,
             start=config.START_PAGE,
             keywords=config.KEYWORDS,
+            dy_search_sort=config.DY_SEARCH_SORT,
             get_comment=config.ENABLE_GET_COMMENTS,
             get_sub_comment=config.ENABLE_GET_SUB_COMMENTS,
             get_media=config.ENABLE_GET_MEIDAS,

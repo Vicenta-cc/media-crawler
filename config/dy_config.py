@@ -19,6 +19,7 @@
 
 # Douyin platform configuration
 PUBLISH_TIME_TYPE = 0
+DY_SEARCH_SORT = "general"  # general | most_liked | latest
 
 # Search API returns up to this many results per offset page.
 # Keep pagination stride equal to the requested count to avoid page overlap.
