@@ -177,6 +177,7 @@ async def update_douyin_aweme(aweme_item: Dict):
         "custom_verify": str(user_info.get("custom_verify") or ""),
         "enterprise_verify_reason": str(user_info.get("enterprise_verify_reason") or ""),
         "follower_count": str(user_info.get("follower_count") if user_info.get("follower_count") is not None else ""),
+        "max_follower_count": str(user_info.get("max_follower_count") if user_info.get("max_follower_count") is not None else ""),
         "verification_type": str(user_info.get("verification_type") if user_info.get("verification_type") is not None else ""),
         "nickname": user_info.get("nickname"),
         "avatar": user_info.get("avatar_thumb", {}).get("url_list", [""])[0],

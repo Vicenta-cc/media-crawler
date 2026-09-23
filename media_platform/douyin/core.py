@@ -382,10 +382,12 @@ class DouYinCrawler(AbstractCrawler):
                     if config.STREAM_ITEMS:
                         await self.get_aweme_media(aweme_item=aweme_info)
                         await self.batch_get_note_comments([aweme_id])
+                        await self._enrich_author_profile(aweme_info)
                         await douyin_store.update_douyin_aweme(aweme_item=aweme_info)
                     else:
                         page_aweme_list.append(aweme_info.get("aweme_id", ""))
                         await self.get_aweme_media(aweme_item=aweme_info)
+                        await self._enrich_author_profile(aweme_info)
                         await douyin_store.update_douyin_aweme(aweme_item=aweme_info)
                 
                 # Batch get note comments for the current page
@@ -410,6 +412,72 @@ class DouYinCrawler(AbstractCrawler):
                     )
         if reusable_conn:
             reusable_conn.close()
+
+    async def _enrich_author_profile(self, aweme_info: Dict) -> None:
+        """Fill a search result's slimmed author from the user profile API.
+
+        Search responses report ``follower_count`` 0 and omit ``signature`` even
+        for accounts with millions of followers, so the profile endpoint is the
+        only source for the identity fields downstream triage scores on.  One
+        request per author per run; the shared request scheduler paces the call,
+        so no extra sleep belongs here.
+        """
+        if not getattr(config, "DY_FETCH_AUTHOR_PROFILE", False):
+            return
+        author = aweme_info.get("author") or {}
+        sec_uid = str(author.get("sec_uid") or "").strip()
+        if not sec_uid:
+            return
+
+        cache = getattr(self, "_author_profile_cache", None)
+        if cache is None:
+            cache = {}
+            self._author_profile_cache = cache
+
+        profile = cache.get(sec_uid)
+        if profile is None:
+            try:
+                res = await self.dy_client.get_user_info(sec_uid)
+            except asyncio.CancelledError:
+                raise
+            except PlatformRateLimitedError:
+                raise
+            except DataFetchError as ex:
+                if "ACCOUNT_VERIFY" in str(ex) or "ACCOUNT_AUTH_INVALID" in str(ex):
+                    raise
+                utils.logger.warning(
+                    f"[DouYinCrawler.search] author profile fetch failed for {sec_uid}: {ex}"
+                )
+                cache[sec_uid] = {}
+                return
+            except Exception as ex:
+                utils.logger.warning(
+                    f"[DouYinCrawler.search] author profile fetch failed for {sec_uid}: {ex}"
+                )
+                cache[sec_uid] = {}
+                return
+            profile = (res or {}).get("user") or {}
+            cache[sec_uid] = profile
+            utils.logger.info(
+                f"[DouYinCrawler.search] author profile: "
+                f"{profile.get('nickname') or author.get('nickname')} "
+                f"followers={profile.get('follower_count')}"
+            )
+
+        for field in (
+            "follower_count",
+            "max_follower_count",
+            "signature",
+            "custom_verify",
+            "enterprise_verify_reason",
+            "verification_type",
+            "following_count",
+            "total_favorited",
+            "aweme_count",
+        ):
+            if field in profile:
+                author[field] = profile[field]
+        aweme_info["author"] = author
 
     async def get_specified_awemes(self):
         """Get the information and comments of the specified post from URLs or IDs"""

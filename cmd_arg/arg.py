@@ -256,6 +256,15 @@ async def parse_cmd(argv: Optional[Sequence[str]] = None):
                 show_default=True,
             ),
         ] = str(config.ENABLE_GET_MEIDAS),
+        dy_fetch_author_profile: Annotated[
+            str,
+            typer.Option(
+                "--dy_fetch_author_profile",
+                help="Douyin search: fetch each author's profile (followers, signature, verification), supports yes/true/t/y/1 or no/false/f/n/0",
+                rich_help_panel="Basic Configuration",
+                show_default=True,
+            ),
+        ] = str(config.DY_FETCH_AUTHOR_PROFILE),
         stream_items: Annotated[
             str,
             typer.Option(
@@ -467,6 +476,7 @@ async def parse_cmd(argv: Optional[Sequence[str]] = None):
         enable_comment = _to_bool(get_comment)
         enable_sub_comment = _to_bool(get_sub_comment)
         enable_media = _to_bool(get_media)
+        fetch_author_profile = _to_bool(dy_fetch_author_profile)
         stream_items_value = _to_bool(stream_items)
         enable_headless = _to_bool(headless)
         enable_background_browser = _to_bool(background_browser)
@@ -488,6 +498,7 @@ async def parse_cmd(argv: Optional[Sequence[str]] = None):
         config.ENABLE_GET_COMMENTS = enable_comment
         config.ENABLE_GET_SUB_COMMENTS = enable_sub_comment
         config.ENABLE_GET_MEIDAS = enable_media
+        config.DY_FETCH_AUTHOR_PROFILE = fetch_author_profile
         config.STREAM_ITEMS = stream_items_value
         config.DY_SKIP_AWEME_IDS_FILE = skip_aweme_ids_file
         config.DY_REUSABLE_CONTENT_DB = reusable_content_db
@@ -564,6 +575,7 @@ async def parse_cmd(argv: Optional[Sequence[str]] = None):
             get_comment=config.ENABLE_GET_COMMENTS,
             get_sub_comment=config.ENABLE_GET_SUB_COMMENTS,
             get_media=config.ENABLE_GET_MEIDAS,
+            dy_fetch_author_profile=config.DY_FETCH_AUTHOR_PROFILE,
             stream_items=config.STREAM_ITEMS,
             headless=config.HEADLESS,
             background_browser=config.ENABLE_BACKGROUND_BROWSER_MODE,
