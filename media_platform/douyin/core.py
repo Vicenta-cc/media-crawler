@@ -252,8 +252,6 @@ class DouYinCrawler(AbstractCrawler):
                 reusable_conn = sqlite3.connect(reusable_db)
             except sqlite3.Error as exc:
                 utils.logger.warning(f"[DouYinCrawler.search] cannot open reusable content DB: {exc}")
-        if not config.STREAM_ITEMS and config.CRAWLER_MAX_NOTES_COUNT < dy_limit_count:
-            config.CRAWLER_MAX_NOTES_COUNT = dy_limit_count
         configured_start_page = max(0, int(config.START_PAGE))
         # The CLI and product settings are one-based. Douyin's search offset is
         # zero-based; keep 0 as a backwards-compatible alias for the first page.

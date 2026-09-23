@@ -21,6 +21,9 @@
 PUBLISH_TIME_TYPE = 0
 DY_SEARCH_SORT = "general"  # general | most_liked | latest
 
+# 1 = let Douyin auto-correct the query, 0 = search the literal keyword
+DY_QUERY_CORRECT_TYPE = 1
+
 # Search API returns up to this many results per offset page.
 # Keep pagination stride equal to the requested count to avoid page overlap.
 DY_SEARCH_PAGE_SIZE = 15

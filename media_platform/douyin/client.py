@@ -290,7 +290,7 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
             'enable_history': '1',
             'keyword': keyword,
             'search_source': 'tab_search',
-            'query_correct_type': '1',
+            'query_correct_type': str(int(getattr(config, "DY_QUERY_CORRECT_TYPE", 1))),
             'is_filter_search': '0',
             'from_group_id': '7378810571505847586',
             'offset': offset,

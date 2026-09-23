@@ -222,6 +222,13 @@ async def parse_cmd(argv: Optional[Sequence[str]] = None):
             config.DY_SEARCH_SORT,
             DouyinSearchSortEnum.GENERAL,
         ),
+        dy_query_correct_type: Annotated[
+            int,
+            typer.Option(
+                "--dy_query_correct_type",
+                help="Douyin search auto-correct: 1 on (platform default), 0 off (literal keyword)",
+            ),
+        ] = config.DY_QUERY_CORRECT_TYPE,
         get_comment: Annotated[
             str,
             typer.Option(
@@ -477,6 +484,7 @@ async def parse_cmd(argv: Optional[Sequence[str]] = None):
         config.START_PAGE = start
         config.KEYWORDS = keywords
         config.DY_SEARCH_SORT = dy_search_sort.value
+        config.DY_QUERY_CORRECT_TYPE = 1 if int(dy_query_correct_type) else 0
         config.ENABLE_GET_COMMENTS = enable_comment
         config.ENABLE_GET_SUB_COMMENTS = enable_sub_comment
         config.ENABLE_GET_MEIDAS = enable_media
@@ -552,6 +560,7 @@ async def parse_cmd(argv: Optional[Sequence[str]] = None):
             start=config.START_PAGE,
             keywords=config.KEYWORDS,
             dy_search_sort=config.DY_SEARCH_SORT,
+            dy_query_correct_type=config.DY_QUERY_CORRECT_TYPE,
             get_comment=config.ENABLE_GET_COMMENTS,
             get_sub_comment=config.ENABLE_GET_SUB_COMMENTS,
             get_media=config.ENABLE_GET_MEIDAS,
