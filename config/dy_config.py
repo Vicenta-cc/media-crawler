@@ -31,6 +31,7 @@ DY_SEARCH_MAX_PAGES = 1000
 DY_SEARCH_MAX_NO_PROGRESS_PAGES = 3
 DY_SKIP_AWEME_IDS_FILE = ""
 DY_REUSABLE_CONTENT_DB = ""
+DY_FETCH_AUTHOR_PROFILE = False  # search mode: enrich each stored item's author from the user profile API (follower_count, signature, verification)
 DY_REQUEST_SCHEDULER_DB = ""
 DY_REQUEST_MIN_INTERVAL = 2.0
 DY_REQUESTS_PER_MINUTE = 30
