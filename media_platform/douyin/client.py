@@ -314,9 +314,26 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
         :param aweme_id:
         :return:
         """
-        params = {"aweme_id": aweme_id}
+        # Detail requires the browser's existing identity in explicit fields;
+        # Cookie alone produced ArgusSecurityPlugin Uifid Not Found. Keep the
+        # fields from the same account and read current cookies on every call.
+        uifid = self.cookie_dict.get("UIFID") or self.cookie_dict.get("UIFID_TEMP", "")
+        fingerprint = self.cookie_dict.get("s_v_web_id", "")
+        params = {
+            "aweme_id": aweme_id,
+            "uifid": uifid,
+            "verifyFp": fingerprint,
+            "fp": fingerprint,
+        }
         headers = copy.copy(self.headers)
-        del headers["Origin"]
+        headers.pop("Origin", None)
+        if uifid:
+            headers["uifid"] = uifid
+        # Upstream NanmiCoder/MediaCrawler currently uses this compatibility
+        # marker. It is not a browser-generated signature; retain rejection
+        # handling if the gateway starts requiring a verified signature.
+        # Scope the compatibility change to detail, including media refresh.
+        headers.setdefault("x-tt-argus", "1")
         res = await self.get("/aweme/v1/web/aweme/detail/", params, headers, operation=operation)
         return res.get("aweme_detail", {})
 
