@@ -179,6 +179,8 @@ async def update_douyin_aweme(aweme_item: Dict):
         "follower_count": str(user_info.get("follower_count") if user_info.get("follower_count") is not None else ""),
         "max_follower_count": str(user_info.get("max_follower_count") if user_info.get("max_follower_count") is not None else ""),
         "verification_type": str(user_info.get("verification_type") if user_info.get("verification_type") is not None else ""),
+        # 作者资料接口返回"IP属地：江苏"，去掉前缀与评论的 ip_location 保持同一格式
+        "author_ip_location": str(user_info.get("ip_location") or "").replace("IP属地：", "").replace("IP属地:", "").strip(),
         "nickname": user_info.get("nickname"),
         "avatar": user_info.get("avatar_thumb", {}).get("url_list", [""])[0],
         "liked_count": str(interact_info.get("digg_count")),
