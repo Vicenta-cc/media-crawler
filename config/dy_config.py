@@ -32,6 +32,9 @@ DY_SEARCH_MAX_NO_PROGRESS_PAGES = 3
 DY_SKIP_AWEME_IDS_FILE = ""
 DY_REUSABLE_CONTENT_DB = ""
 DY_FETCH_AUTHOR_PROFILE = False  # search mode: enrich each stored item's author from the user profile API (follower_count, signature, verification)
+# 打开抖音首页遇到瞬时网络错误（如 net::ERR_NETWORK_CHANGED）时的重试次数与退避秒数（第 n 次重试等 n×退避秒）
+DY_PAGE_LOAD_RETRIES = 2
+DY_PAGE_LOAD_RETRY_BACKOFF_SECONDS = 3.0
 DY_REQUEST_SCHEDULER_DB = ""
 DY_REQUEST_MIN_INTERVAL = 2.0
 DY_REQUESTS_PER_MINUTE = 30
