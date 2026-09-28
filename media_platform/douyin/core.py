@@ -28,6 +28,8 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 
+from playwright.async_api import Error as PlaywrightError
+from playwright.async_api import TimeoutError as PlaywrightTimeoutError
 from playwright.async_api import (
     BrowserContext,
     BrowserType,
@@ -217,9 +219,49 @@ class DouYinCrawler(AbstractCrawler):
             proxy=playwright_proxy,
         )
 
+    # Chromium network-layer failures that a fresh attempt normally clears
+    # (interface/IP/proxy change, reset connection, DNS hiccup).
+    _TRANSIENT_NET_ERRORS = (
+        "ERR_NETWORK_CHANGED",
+        "ERR_CONNECTION_RESET",
+        "ERR_CONNECTION_CLOSED",
+        "ERR_CONNECTION_REFUSED",
+        "ERR_CONNECTION_TIMED_OUT",
+        "ERR_TIMED_OUT",
+        "ERR_INTERNET_DISCONNECTED",
+        "ERR_NAME_NOT_RESOLVED",
+        "ERR_NETWORK_IO_SUSPENDED",
+        "ERR_ADDRESS_UNREACHABLE",
+        "ERR_EMPTY_RESPONSE",
+        "ERR_PROXY_CONNECTION_FAILED",
+        "ERR_TUNNEL_CONNECTION_FAILED",
+    )
+
+    @classmethod
+    def _is_transient_page_load_error(cls, exc: Exception) -> bool:
+        if isinstance(exc, PlaywrightTimeoutError):
+            return True
+        text = str(exc)
+        return any(code in text for code in cls._TRANSIENT_NET_ERRORS)
+
     async def _open_index_page(self) -> None:
         self.context_page = await self.browser_context.new_page()
-        await self.context_page.goto(self.index_url)
+        retries = max(0, int(getattr(config, "DY_PAGE_LOAD_RETRIES", 2)))
+        backoff = max(0.0, float(getattr(config, "DY_PAGE_LOAD_RETRY_BACKOFF_SECONDS", 3.0)))
+        attempt = 0
+        while True:
+            try:
+                await self.context_page.goto(self.index_url)
+                return
+            except PlaywrightError as exc:
+                if attempt >= retries or not self._is_transient_page_load_error(exc):
+                    raise
+                attempt += 1
+                utils.logger.warning(
+                    f"[DouYinCrawler._open_index_page] transient network error, retry {attempt}/{retries}: "
+                    f"{str(exc).splitlines()[0][:160]}"
+                )
+                await asyncio.sleep(backoff * attempt)
 
     async def _close_current_browser(self) -> None:
         if self.cdp_manager:
