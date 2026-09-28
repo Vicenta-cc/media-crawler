@@ -33,7 +33,7 @@ PROFILES = {
             "aweme_count": 100,
         }
     },
-    "secB": {"user": {"follower_count": 12, "signature": "普通用户签名"}},
+    "secB": {"user": {"follower_count": 12, "signature": "普通用户签名", "ip_location": "IP属地：湖南"}},
 }
 
 
@@ -105,6 +105,8 @@ async def test_profile_is_fetched_once_per_author_and_reaches_the_store(monkeypa
     assert stored[0]["author"]["enterprise_verify_reason"] == "新华社"
     assert stored[0]["author"]["verification_type"] == 1
     assert stored[0]["author"]["nickname"] == "新华社"  # search fields survive
+    assert stored[-1]["author"]["ip_location"] == "IP属地：湖南"
+    assert "ip_location" not in stored[0]["author"]  # absent in profile -> not invented
 
 
 @pytest.mark.asyncio

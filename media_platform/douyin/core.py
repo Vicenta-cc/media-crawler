@@ -474,6 +474,7 @@ class DouYinCrawler(AbstractCrawler):
             "following_count",
             "total_favorited",
             "aweme_count",
+            "ip_location",
         ):
             if field in profile:
                 author[field] = profile[field]
