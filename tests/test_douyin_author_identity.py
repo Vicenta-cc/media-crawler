@@ -100,3 +100,19 @@ async def test_stored_item_maps_onto_the_db_model(stored):
 
     assert row.custom_verify == "黄V"
     assert row.follower_count == "600000"
+
+
+@pytest.mark.asyncio
+async def test_author_ip_location_is_stored_without_the_label_prefix(stored):
+    await douyin_store.update_douyin_aweme(aweme({"uid": "u1", "sec_uid": "sec1", "ip_location": "IP属地：江苏"}))
+    assert stored[-1]["author_ip_location"] == "江苏"
+
+
+@pytest.mark.asyncio
+async def test_missing_author_ip_location_yields_empty_string(stored):
+    await douyin_store.update_douyin_aweme(aweme({"uid": "u1", "sec_uid": "sec1"}))
+    assert stored[-1]["author_ip_location"] == ""
+
+
+def test_author_ip_location_column_exists():
+    assert "author_ip_location" in DouyinAweme.__table__.columns

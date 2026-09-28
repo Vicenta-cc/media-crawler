@@ -124,6 +124,7 @@ class DouyinAweme(Base):
     follower_count = Column(Text, default='', comment='粉丝数')
     max_follower_count = Column(Text, default='', comment='历史最高粉丝数')
     verification_type = Column(Text, default='', comment='认证类型')
+    author_ip_location = Column(Text, default='', comment='作者IP属地（省级）')
     ip_location = Column(Text, comment='IP地址位置')
     add_ts = Column(BigInteger, comment='添加时间戳')
     last_modify_ts = Column(BigInteger, comment='最后修改时间戳')
