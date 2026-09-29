@@ -40,6 +40,13 @@ DY_REQUEST_MIN_INTERVAL = 2.0
 DY_REQUESTS_PER_MINUTE = 30
 DY_REQUEST_CONCURRENCY = 1
 DY_REQUEST_COOLDOWN_SECONDS = 300.0
+# Per-account pacing on top of the shared per-IP gate, keyed dy:account:<MEDIACRAWLER_ACCOUNT_ID>.
+DY_ACCOUNT_REQUESTS_PER_MINUTE = 20
+DY_ACCOUNT_MIN_INTERVAL = 3.0
+# Randomise pacing waits by ±this fraction (never below 0.5× base); 0 disables.
+DY_PACING_JITTER = 0.4
+# Search mode: skip the author profile request when enterprise_verify_reason matches (re.search).
+DY_SKIP_PROFILE_VERIFY_REGEX = ""
 
 # Space media GETs and URL refreshes, including fallbacks. No burst on retry.
 DY_MEDIA_REQUEST_INTERVAL = 5.0

@@ -48,6 +48,13 @@ def isolated_douyin_scheduler(tmp_path, monkeypatch):
     monkeypatch.setattr(config, "DY_REQUESTS_PER_MINUTE", 10000)
     monkeypatch.setattr(config, "DY_MEDIA_REQUEST_INTERVAL", 0.0)
     monkeypatch.setattr(config, "DY_REQUEST_CONCURRENCY", 1)
+    monkeypatch.delenv("MEDIACRAWLER_ACCOUNT_ID", raising=False)
+    monkeypatch.setattr(config, "DY_ACCOUNT_MIN_INTERVAL", 0.0)
+    monkeypatch.setattr(config, "DY_ACCOUNT_REQUESTS_PER_MINUTE", 10000)
+    monkeypatch.setattr(config, "DY_PACING_JITTER", 0.0)
+    from media_platform.douyin import pacing
+
+    pacing.reset_silent_risk()
 
 
 @pytest.fixture

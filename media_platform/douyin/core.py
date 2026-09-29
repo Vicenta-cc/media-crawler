@@ -18,6 +18,8 @@
 # 使用本代码即表示您同意遵守上述原则和LICENSE中的所有条款。
 
 import asyncio
+import functools
+import re
 import sqlite3
 import json
 from pathlib import Path
@@ -57,6 +59,18 @@ from .exception import DataFetchError, MediaDownloadError, PlatformRateLimitedEr
 from .field import PublishTimeType, SearchSortType
 from .help import parse_video_info_from_url, parse_creator_info_from_url
 from .login import DouYinLogin
+from .pacing import jittered_sleep, record_content_ok, record_silent_risk
+
+
+@functools.lru_cache(maxsize=8)
+def _compiled_skip_profile_regex(pattern: str) -> Optional["re.Pattern[str]"]:
+    try:
+        return re.compile(pattern)
+    except re.error as exc:
+        utils.logger.warning(
+            f"[DouYinCrawler] invalid DY_SKIP_PROFILE_VERIFY_REGEX ignored: {exc}"
+        )
+        return None
 
 
 def reusable_aweme_is_complete(raw_item_path: str, content_key: str) -> bool:
@@ -341,6 +355,7 @@ class DouYinCrawler(AbstractCrawler):
             requested_pages = 0
             no_progress_pages = 0
             dy_search_id = ""
+            previous_has_more = False
             while len(aweme_list) < config.CRAWLER_MAX_NOTES_COUNT:
                 if requested_pages >= page_limit:
                     raise DataFetchError(
@@ -367,7 +382,12 @@ class DouYinCrawler(AbstractCrawler):
                     )
                     if posts_res.get("data") is None or posts_res.get("data") == []:
                         utils.logger.info(f"[DouYinCrawler.search] search douyin keyword: {keyword}, page: {page} is empty,{posts_res.get('data')}`")
+                        # A keyword may have no results; emptiness only signals
+                        # risk after the previous page promised more.
+                        if previous_has_more and posts_res.get("status_code") in (None, 0, "0"):
+                            record_silent_risk("search")
                         break
+                    record_content_ok()
                 except DataFetchError as exc:
                     utils.logger.error(
                         f"[DouYinCrawler.search] search douyin keyword: {keyword} failed: {exc}"
@@ -439,10 +459,11 @@ class DouYinCrawler(AbstractCrawler):
                 # Sleep after each page navigation
                 completed_page = page
                 page += 1
-                await asyncio.sleep(config.CRAWLER_MAX_SLEEP_SEC)
-                utils.logger.info(f"[DouYinCrawler.search] Sleeping for {config.CRAWLER_MAX_SLEEP_SEC} seconds after page {completed_page}")
+                slept = await jittered_sleep(config.CRAWLER_MAX_SLEEP_SEC)
+                utils.logger.info(f"[DouYinCrawler.search] Sleeping for {slept:.2f} seconds after page {completed_page}")
                 utils.logger.info(f"[DouYinCrawler.search] keyword:{keyword}, aweme_list:{aweme_list}")
                 has_more = posts_res.get("has_more")
+                previous_has_more = bool(has_more)
                 if has_more is not None and not bool(has_more):
                     break
                 no_progress_pages = (
@@ -470,6 +491,14 @@ class DouYinCrawler(AbstractCrawler):
         sec_uid = str(author.get("sec_uid") or "").strip()
         if not sec_uid:
             return
+        skip_pattern = str(getattr(config, "DY_SKIP_PROFILE_VERIFY_REGEX", "") or "")
+        if skip_pattern:
+            # The app discards official accounts anyway; spare the profile request.
+            regex = _compiled_skip_profile_regex(skip_pattern)
+            reason = str(author.get("enterprise_verify_reason") or "")
+            if regex is not None and reason and regex.search(reason):
+                utils.logger.info(f"[DouYinCrawler.search] skip author profile for official account {sec_uid}")
+                return
 
         cache = getattr(self, "_author_profile_cache", None)
         if cache is None:
@@ -549,17 +578,40 @@ class DouYinCrawler(AbstractCrawler):
                 continue
 
         semaphore = asyncio.Semaphore(config.MAX_CONCURRENCY_NUM)
-        task_list = [self.get_aweme_detail(aweme_id=aweme_id, semaphore=semaphore) for aweme_id in aweme_id_list]
-        aweme_details = await asyncio.gather(*task_list)
+        task_list = [
+            asyncio.create_task(self.get_aweme_detail(aweme_id=aweme_id, semaphore=semaphore))
+            for aweme_id in aweme_id_list
+        ]
+        try:
+            aweme_details = await asyncio.gather(*task_list)
+        except BaseException:
+            # A risk error must stop every other post, not only its own.
+            for task in task_list:
+                task.cancel()
+            await asyncio.gather(*task_list, return_exceptions=True)
+            raise
         for aweme_detail in aweme_details:
             if aweme_detail is not None:
                 await douyin_store.update_douyin_aweme(aweme_item=aweme_detail)
                 await self.get_aweme_media(aweme_item=aweme_detail)
         await self.batch_get_note_comments(aweme_id_list)
 
+    _RISK_MARKERS = ("ACCOUNT_VERIFY", "ACCOUNT_AUTH_INVALID", "PLATFORM_RATE_LIMITED")
+
+    def _record_risk_halt(self, ex: BaseException) -> None:
+        """Remember an account/platform risk error so sibling tasks never send another request."""
+        if isinstance(ex, PlatformRateLimitedError) or any(m in str(ex) for m in self._RISK_MARKERS):
+            self._risk_halt = ex
+
+    def _raise_if_risk_halted(self) -> None:
+        ex = getattr(self, "_risk_halt", None)
+        if ex is not None:
+            raise type(ex)(str(ex))
+
     async def get_aweme_detail(self, aweme_id: str, semaphore: asyncio.Semaphore) -> Any:
         """Get note detail"""
         async with self.content_request_slot(semaphore, aweme_id):
+            self._raise_if_risk_halted()
             try:
                 result = await self.dy_client.get_video_by_id(aweme_id)
                 if not isinstance(result, dict) or str(result.get("aweme_id") or "") != str(aweme_id):
@@ -567,8 +619,8 @@ class DouYinCrawler(AbstractCrawler):
                         "COLLECTION_INCOMPLETE: missing_or_mismatched_detail"
                     )
                 # Sleep after fetching aweme detail
-                await asyncio.sleep(config.CRAWLER_MAX_SLEEP_SEC)
-                utils.logger.info(f"[DouYinCrawler.get_aweme_detail] Sleeping for {config.CRAWLER_MAX_SLEEP_SEC} seconds after fetching aweme {aweme_id}")
+                slept = await jittered_sleep(config.CRAWLER_MAX_SLEEP_SEC)
+                utils.logger.info(f"[DouYinCrawler.get_aweme_detail] Sleeping for {slept:.2f} seconds after fetching aweme {aweme_id}")
                 write_collection_status(aweme_id, "detail", "complete")
                 return result
             except asyncio.CancelledError as ex:
@@ -577,6 +629,7 @@ class DouYinCrawler(AbstractCrawler):
                 )
                 raise
             except PlatformRateLimitedError as ex:
+                self._record_risk_halt(ex)
                 write_collection_status(
                     aweme_id, "detail", "interrupted", reason=failure_reason(ex)
                 )
@@ -587,6 +640,7 @@ class DouYinCrawler(AbstractCrawler):
                     aweme_id, "detail", "failed", reason=failure_reason(ex)
                 )
                 if "ACCOUNT_VERIFY" in str(ex) or "ACCOUNT_AUTH_INVALID" in str(ex):
+                    self._record_risk_halt(ex)
                     raise
                 raise CollectionIncompleteError(
                     f"COLLECTION_INCOMPLETE: {failure_reason(ex)}"
@@ -626,6 +680,7 @@ class DouYinCrawler(AbstractCrawler):
 
     async def get_comments(self, aweme_id: str, semaphore: asyncio.Semaphore) -> None:
         async with semaphore:
+            self._raise_if_risk_halted()
             try:
                 # Pass the list of keywords to the get_aweme_all_comments method
                 # Use fixed crawling interval
@@ -638,11 +693,12 @@ class DouYinCrawler(AbstractCrawler):
                     max_count=config.CRAWLER_MAX_COMMENTS_COUNT_SINGLENOTES,
                 )
                 # Sleep after fetching comments
-                await asyncio.sleep(crawl_interval)
-                utils.logger.info(f"[DouYinCrawler.get_comments] Sleeping for {crawl_interval} seconds after fetching comments for aweme {aweme_id}")
+                slept = await jittered_sleep(crawl_interval)
+                utils.logger.info(f"[DouYinCrawler.get_comments] Sleeping for {slept:.2f} seconds after fetching comments for aweme {aweme_id}")
                 utils.logger.info(f"[DouYinCrawler.get_comments] aweme_id: {aweme_id} comments have all been obtained and filtered ...")
             except DataFetchError as e:
                 utils.logger.error(f"[DouYinCrawler.get_comments] aweme_id: {aweme_id} get comments failed, error: {e}")
+                self._record_risk_halt(e)
                 raise
 
     async def get_creators_and_videos(self) -> None:

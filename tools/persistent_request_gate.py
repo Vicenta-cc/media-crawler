@@ -10,6 +10,7 @@ import json
 import math
 import logging
 import os
+import random
 import sqlite3
 import time
 from contextlib import asynccontextmanager
@@ -17,10 +18,18 @@ from pathlib import Path
 from uuid import uuid4
 
 
+def jitter_factor(jitter):
+    """Random pacing multiplier in [1-jitter, 1+jitter], never below 0.5; 0 disables."""
+    jitter = float(jitter or 0)
+    if not math.isfinite(jitter) or jitter <= 0:
+        return 1.0
+    return max(0.5, random.uniform(1 - jitter, 1 + jitter))
+
+
 class RequestScheduler:
     def __init__(self, db_path, *, platform='dy', min_interval=2.0, per_minute=30,
                  max_concurrency=1, media_interval=5.0, cooldown_seconds=300.0,
-                 clock=time.time, sleeper=time.sleep):
+                 jitter=0.0, replace_policy=False, clock=time.time, sleeper=time.sleep):
         if not str(db_path).strip():
             raise ValueError('request scheduler database is required')
         numbers = (min_interval, per_minute, max_concurrency, media_interval, cooldown_seconds)
@@ -32,6 +41,7 @@ class RequestScheduler:
         self.min_interval, self.per_minute = float(min_interval), int(per_minute)
         self.max_concurrency, self.media_interval = int(max_concurrency), float(media_interval)
         self.cooldown_seconds = float(cooldown_seconds)
+        self.jitter = float(jitter)
         self._clock, self._sleeper = clock, sleeper
         with self._connect() as c:
             c.execute('BEGIN IMMEDIATE')
@@ -47,7 +57,10 @@ class RequestScheduler:
             c.execute('CREATE TABLE IF NOT EXISTS request_scheduler_policy (platform TEXT PRIMARY KEY, limits_json TEXT NOT NULL)')
             limits = json.dumps([self.min_interval, self.per_minute, self.max_concurrency, self.media_interval])
             policy = c.execute('SELECT limits_json FROM request_scheduler_policy WHERE platform=?', (platform,)).fetchone()
-            if policy and json.loads(policy[0]) != json.loads(limits):
+            if replace_policy:
+                # Per-account keys: the limits passed on this run always win.
+                c.execute('INSERT OR REPLACE INTO request_scheduler_policy VALUES (?,?)', (platform, limits))
+            elif policy and json.loads(policy[0]) != json.loads(limits):
                 raise ValueError('shared request scheduler policy differs; update the policy explicitly without deleting its database')
             c.execute('INSERT OR IGNORE INTO request_scheduler_policy VALUES (?,?)', (platform, limits))
             # Import legacy pacing conservatively, once. Never erase an existing cooldown.
@@ -93,7 +106,10 @@ class RequestScheduler:
             row = c.execute('SELECT next_allowed_at,cooldown_until,request_times_json FROM request_scheduler_state WHERE platform=?', (self.platform,)).fetchone()
             next_at, cooldown, times = (float(row[0]), float(row[1]), self._times(row[2])) if row else (0.0, 0.0, [])
             times = sorted(x for x in times if x > now - 60)
-            target = max(now, next_at, cooldown, times[-1] + interval if times else now)
+            # next_at already carries the jittered interval; the timestamp floor
+            # admits the shortest jittered gap without undercutting it.
+            floor = max(.5, 1 - self.jitter) if self.jitter > 0 else 1.0
+            target = max(now, next_at, cooldown, times[-1] + interval * floor if times else now)
             reason = 'cooldown' if cooldown > now else 'interval'
             if len(times) >= per_minute:
                 target = max(target, times[-int(per_minute)] + 60)
@@ -118,7 +134,7 @@ class RequestScheduler:
             times.append(now)
             c.execute('''INSERT INTO request_scheduler_state(platform,next_allowed_at,request_times_json,updated_at) VALUES(?,?,?,?)
                 ON CONFLICT(platform) DO UPDATE SET next_allowed_at=excluded.next_allowed_at,request_times_json=excluded.request_times_json,updated_at=excluded.updated_at''',
-                (self.platform, now + interval, json.dumps(times), now))
+                (self.platform, now + interval * jitter_factor(self.jitter), json.dumps(times), now))
             if operation in ('media', 'media_refresh'):
                 c.execute("INSERT INTO request_scheduler_channels(platform,channel,next_at,last_start) VALUES (?,'media',?,?) ON CONFLICT(platform,channel) DO UPDATE SET next_at=excluded.next_at,last_start=excluded.last_start", (self.platform, now + media_interval, now))
             if token:
@@ -156,6 +172,10 @@ class RequestScheduler:
         with self._connect() as c:
             c.execute('UPDATE request_scheduler_policy SET limits_json=? WHERE platform=?', (json.dumps(values), self.platform))
 
+    def policy(self):
+        with self._connect() as c:
+            return json.loads(c.execute('SELECT limits_json FROM request_scheduler_policy WHERE platform=?', (self.platform,)).fetchone()[0])
+
     def snapshot(self):
         with self._connect() as c:
             row = c.execute('SELECT next_allowed_at,cooldown_until,request_times_json,last_reason FROM request_scheduler_state WHERE platform=?', (self.platform,)).fetchone()
@@ -191,8 +211,8 @@ class PersistentRequestGate:
             # Bounded polling responds to cancellation, cooldown extension and policy changes.
             await asyncio.sleep(min(delay, .25))
 
-    async def acquire(self):
-        _, waited = await self._reserve('api')
+    async def acquire(self, operation='api'):
+        _, waited = await self._reserve(operation)
         return waited
 
     @asynccontextmanager
@@ -208,18 +228,23 @@ class PersistentRequestGate:
             self.state.release(token)
 
 
-def configured_gate(*, db_path='', min_interval=2.0, per_minute=30,
-                    max_concurrency=1, media_interval=5.0, cooldown_seconds=300):
+def scheduler_db_path(db_path=''):
     path = str(db_path).strip() or os.getenv('MEDIACRAWLER_REQUEST_SCHEDULER_DB', '').strip()
     if not path:
         root = os.getenv('MEDIACRAWLER_CLOAK_PROFILE_ROOT', '').strip()
         if not root or not Path(root).is_absolute():
             raise ValueError('Douyin requires --request_scheduler_db or an absolute MEDIACRAWLER_CLOAK_PROFILE_ROOT')
         path = str(Path(root) / 'request_scheduler.sqlite3')
+    return path
+
+
+def configured_gate(*, db_path='', min_interval=2.0, per_minute=30,
+                    max_concurrency=1, media_interval=5.0, cooldown_seconds=300, jitter=0.0):
+    path = scheduler_db_path(db_path)
     def value(name, default, cast=float):
         return cast(os.getenv('MEDIACRAWLER_' + name, str(default)))
     return PersistentRequestGate(path, min_interval=value('REQUEST_MIN_INTERVAL', min_interval),
         per_minute=value('REQUESTS_PER_MINUTE', per_minute, int),
         max_concurrency=value('REQUEST_CONCURRENCY', max_concurrency, int),
         media_interval=value('MEDIA_REQUEST_INTERVAL', media_interval),
-        cooldown_seconds=value('REQUEST_COOLDOWN_SECONDS', cooldown_seconds))
+        cooldown_seconds=value('REQUEST_COOLDOWN_SECONDS', cooldown_seconds), jitter=jitter)

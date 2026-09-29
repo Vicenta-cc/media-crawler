@@ -265,6 +265,14 @@ async def parse_cmd(argv: Optional[Sequence[str]] = None):
                 show_default=True,
             ),
         ] = str(config.DY_FETCH_AUTHOR_PROFILE),
+        dy_skip_profile_verify_regex: Annotated[
+            str,
+            typer.Option(
+                "--dy_skip_profile_verify_regex",
+                help="Douyin search: skip the author profile request when the author's enterprise_verify_reason matches this regex",
+                rich_help_panel="Basic Configuration",
+            ),
+        ] = config.DY_SKIP_PROFILE_VERIFY_REGEX,
         stream_items: Annotated[
             str,
             typer.Option(
@@ -325,6 +333,8 @@ async def parse_cmd(argv: Optional[Sequence[str]] = None):
         request_concurrency: Annotated[int, typer.Option("--request_concurrency", min=1)] = 1,
         media_request_interval: Annotated[float, typer.Option("--media_request_interval", min=0.0)] = 5.0,
         request_cooldown_seconds: Annotated[float, typer.Option("--request_cooldown_seconds", min=0.0)] = 300.0,
+        account_requests_per_minute: Annotated[int, typer.Option("--account_requests_per_minute", min=1)] = 20,
+        account_min_interval: Annotated[float, typer.Option("--account_min_interval", min=0.0)] = 3.0,
         headless: Annotated[
             str,
             typer.Option(
@@ -499,6 +509,7 @@ async def parse_cmd(argv: Optional[Sequence[str]] = None):
         config.ENABLE_GET_SUB_COMMENTS = enable_sub_comment
         config.ENABLE_GET_MEIDAS = enable_media
         config.DY_FETCH_AUTHOR_PROFILE = fetch_author_profile
+        config.DY_SKIP_PROFILE_VERIFY_REGEX = dy_skip_profile_verify_regex
         config.STREAM_ITEMS = stream_items_value
         config.DY_SKIP_AWEME_IDS_FILE = skip_aweme_ids_file
         config.DY_REUSABLE_CONTENT_DB = reusable_content_db
@@ -512,6 +523,8 @@ async def parse_cmd(argv: Optional[Sequence[str]] = None):
         config.DY_REQUEST_CONCURRENCY = request_concurrency
         config.DY_MEDIA_REQUEST_INTERVAL = media_request_interval
         config.DY_REQUEST_COOLDOWN_SECONDS = request_cooldown_seconds
+        config.DY_ACCOUNT_REQUESTS_PER_MINUTE = account_requests_per_minute
+        config.DY_ACCOUNT_MIN_INTERVAL = account_min_interval
         config.HEADLESS = enable_headless
         config.CDP_HEADLESS = enable_headless
         config.HEADLESS_EXPLICITLY_SET = _has_option(cli_args, "--headless")
@@ -576,6 +589,9 @@ async def parse_cmd(argv: Optional[Sequence[str]] = None):
             get_sub_comment=config.ENABLE_GET_SUB_COMMENTS,
             get_media=config.ENABLE_GET_MEIDAS,
             dy_fetch_author_profile=config.DY_FETCH_AUTHOR_PROFILE,
+            dy_skip_profile_verify_regex=config.DY_SKIP_PROFILE_VERIFY_REGEX,
+            account_requests_per_minute=config.DY_ACCOUNT_REQUESTS_PER_MINUTE,
+            account_min_interval=config.DY_ACCOUNT_MIN_INTERVAL,
             stream_items=config.STREAM_ITEMS,
             headless=config.HEADLESS,
             background_browser=config.ENABLE_BACKGROUND_BROWSER_MODE,

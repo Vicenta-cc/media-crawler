@@ -20,6 +20,7 @@
 import asyncio
 import copy
 import json
+import os
 import time
 from email.utils import parsedate_to_datetime
 import urllib.parse
@@ -33,7 +34,7 @@ from base.base_crawler import AbstractApiClient
 from proxy.proxy_mixin import ProxyRefreshMixin
 from tools import utils
 from tools.httpx_util import make_async_client
-from tools.persistent_request_gate import configured_gate
+from tools.persistent_request_gate import PersistentRequestGate, configured_gate, scheduler_db_path
 from var import request_keyword_var
 
 if TYPE_CHECKING:
@@ -42,6 +43,7 @@ if TYPE_CHECKING:
 from .exception import *
 from .field import *
 from .help import *
+from . import pacing
 
 
 class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
@@ -86,9 +88,30 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
             max_concurrency=config.DY_REQUEST_CONCURRENCY,
             media_interval=config.DY_MEDIA_REQUEST_INTERVAL,
             cooldown_seconds=config.DY_REQUEST_COOLDOWN_SECONDS,
+            jitter=config.DY_PACING_JITTER,
         )
+        self._account_gate = self._configured_account_gate()
         # Initialize proxy pool (from ProxyRefreshMixin)
         self.init_proxy_pool(proxy_ip_pool)
+
+    def _configured_account_gate(self) -> Optional[PersistentRequestGate]:
+        """Second, per-identity gate in the same DB; the platform gate stays the per-IP limit."""
+        account_id = os.getenv("MEDIACRAWLER_ACCOUNT_ID", "").strip()
+        if not account_id:
+            return None
+        shared = self._persistent_gate.state
+        # The app lowers limits for new / recently-blocked accounts: this run's limits win.
+        return PersistentRequestGate(
+            scheduler_db_path(config.DY_REQUEST_SCHEDULER_DB),
+            platform=f"dy:account:{account_id}",
+            min_interval=config.DY_ACCOUNT_MIN_INTERVAL,
+            per_minute=config.DY_ACCOUNT_REQUESTS_PER_MINUTE,
+            max_concurrency=shared.max_concurrency,
+            media_interval=shared.media_interval,
+            cooldown_seconds=shared.cooldown_seconds,
+            jitter=config.DY_PACING_JITTER,
+            replace_policy=True,
+        )
 
     async def __process_req_params(
         self,
@@ -187,8 +210,14 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
         timeout = self.timeout if timeout is None else timeout
         async with make_async_client(proxy=self.proxy, follow_redirects=False) as client:
             for hop in range(11):
+                # Reserve the account first so the per-IP reservation stays next to the transport call.
+                account_gate = getattr(self, "_account_gate", None)
+                account_waited = await account_gate.acquire(operation) if account_gate else 0.0
                 async with self._persistent_gate.slot(operation, timeout=timeout) as waited:
-                    utils.logger.info(f"REQUEST_SCHEDULER operation={operation} waited_seconds={waited:.3f}")
+                    utils.logger.info(
+                        f"REQUEST_SCHEDULER operation={operation} waited_seconds={waited:.3f} "
+                        f"account_waited_seconds={account_waited:.3f}"
+                    )
                     response = await client.request(method, url, timeout=timeout, follow_redirects=False, **kwargs)
                     if response.status_code == 429:
                         raw = response.headers.get('Retry-After', '')
@@ -335,7 +364,12 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
         # Scope the compatibility change to detail, including media refresh.
         headers.setdefault("x-tt-argus", "1")
         res = await self.get("/aweme/v1/web/aweme/detail/", params, headers, operation=operation)
-        return res.get("aweme_detail", {})
+        detail = res.get("aweme_detail")
+        if pacing.is_ok_status(res) and not detail:
+            pacing.record_silent_risk("aweme_detail")
+        elif detail:
+            pacing.record_content_ok()
+        return detail or {}
 
     async def get_aweme_comments(self, aweme_id: str, cursor: int = 0):
         """get note comments
@@ -481,7 +515,12 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
             "publish_video_strategy_type": 2,
             "personal_center_strategy": 1,
         }
-        return await self.get(uri, params)
+        res = await self.get(uri, params)
+        if pacing.is_ok_status(res) and not res.get("user"):
+            pacing.record_silent_risk("user_profile")
+        elif res.get("user"):
+            pacing.record_content_ok()
+        return res
 
     async def get_user_aweme_posts(self, sec_user_id: str, max_cursor: str = "") -> Dict:
         uri = "/aweme/v1/web/aweme/post/"
