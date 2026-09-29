@@ -16,6 +16,7 @@ from media_platform.douyin.client import DouYinClient
 from media_platform.douyin.core import DouYinCrawler
 from media_platform.douyin.exception import DataFetchError, PlatformRateLimitedError
 from tools import persistent_request_gate as gate_module
+from tools.collection_status import CollectionIncompleteError
 from tools.persistent_request_gate import RequestScheduler, jitter_factor
 
 
@@ -412,4 +413,52 @@ async def test_detail_unavailable_post_is_not_a_signal(payload):
 ])
 async def test_bare_empty_detail_is_still_a_signal(payload):
     await bare_client(payload).get_video_by_id("1")
+    assert pacing.silent_risk_streak() == 1
+
+
+# --- Fix round 2: single-id detail runs --------------------------------------------
+
+def detail_crawler(monkeypatch, tmp_path, ids, payload):
+    monkeypatch.setattr(config, "SAVE_DATA_PATH", str(tmp_path))
+    monkeypatch.setattr(config, "DY_SPECIFIED_ID_LIST", ids)
+    monkeypatch.setattr(config, "MAX_CONCURRENCY_NUM", 1)
+    monkeypatch.setattr(config, "CRAWLER_MAX_SLEEP_SEC", 0)
+    crawler = DouYinCrawler.__new__(DouYinCrawler)
+    crawler.dy_client = bare_client(payload)
+    crawler.wait_for_content_slot = AsyncMock()
+    crawler.batch_get_note_comments = AsyncMock()
+    return crawler
+
+
+@pytest.mark.asyncio
+async def test_single_id_detail_bare_empty_is_verification_at_once(monkeypatch, tmp_path):
+    crawler = detail_crawler(monkeypatch, tmp_path, ["1"], {"status_code": 0})
+    with pytest.raises(DataFetchError, match="ACCOUNT_VERIFY: silent empty responses"):
+        await crawler.get_specified_awemes()
+    assert crawler.dy_client.get.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_single_id_detail_unavailable_is_not_verification(monkeypatch, tmp_path):
+    crawler = detail_crawler(monkeypatch, tmp_path, ["1"], {"status_code": 0, "filter_detail": {"filter_reason": "deleted"}})
+    with pytest.raises(CollectionIncompleteError):
+        await crawler.get_specified_awemes()
+    assert pacing.silent_risk_streak() == 0
+
+
+@pytest.mark.asyncio
+async def test_multi_id_detail_keeps_threshold_of_two(monkeypatch, tmp_path):
+    crawler = detail_crawler(monkeypatch, tmp_path, ["1", "2"], {"status_code": 0})
+    # With threshold 1 the first bare-empty would already be ACCOUNT_VERIFY.
+    with pytest.raises(CollectionIncompleteError):
+        await crawler.get_specified_awemes()
+
+
+@pytest.mark.asyncio
+async def test_single_id_limit_applies_only_to_detail_endpoint(monkeypatch, tmp_path):
+    crawler = detail_crawler(monkeypatch, tmp_path, ["1"], {"status_code": 0, "aweme_detail": {"aweme_id": "1"}})
+    monkeypatch.setattr("media_platform.douyin.core.douyin_store.update_douyin_aweme", AsyncMock())
+    crawler.get_aweme_media = AsyncMock()
+    await crawler.get_specified_awemes()
+    await bare_client({"status_code": 0}).get_user_info("sec")
     assert pacing.silent_risk_streak() == 1

@@ -59,7 +59,7 @@ from .exception import DataFetchError, MediaDownloadError, PlatformRateLimitedEr
 from .field import PublishTimeType, SearchSortType
 from .help import parse_video_info_from_url, parse_creator_info_from_url
 from .login import DouYinLogin
-from .pacing import jittered_sleep, record_content_ok, record_silent_risk
+from .pacing import jittered_sleep, record_content_ok, record_silent_risk, set_single_detail_target
 
 
 @functools.lru_cache(maxsize=8)
@@ -577,6 +577,7 @@ class DouYinCrawler(AbstractCrawler):
                 utils.logger.error(f"[DouYinCrawler.get_specified_awemes] Failed to parse video URL: {e}")
                 continue
 
+        set_single_detail_target(len(set(aweme_id_list)) == 1)
         semaphore = asyncio.Semaphore(config.MAX_CONCURRENCY_NUM)
         task_list = [
             asyncio.create_task(self.get_aweme_detail(aweme_id=aweme_id, semaphore=semaphore))

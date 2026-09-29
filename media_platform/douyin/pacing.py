@@ -15,6 +15,8 @@ from .exception import DataFetchError
 
 SILENT_RISK_LIMIT = 2
 _silent_risk_streak = 0
+# A single-post detail run has no second request to confirm a signal with.
+_single_detail_target = False
 
 
 def jittered_delay(base: float) -> float:
@@ -40,13 +42,19 @@ def is_unavailable_content(payload) -> bool:
     return isinstance(payload, dict) and any(payload.get(key) for key in _UNAVAILABLE_KEYS)
 
 
+def set_single_detail_target(single: bool) -> None:
+    global _single_detail_target
+    _single_detail_target = bool(single)
+
+
 def record_silent_risk(endpoint: str) -> None:
     global _silent_risk_streak
     _silent_risk_streak += 1
+    limit = 1 if endpoint == "aweme_detail" and _single_detail_target else SILENT_RISK_LIMIT
     utils.logger.warning(
-        f"SILENT_RISK_SIGNAL endpoint={endpoint} consecutive={_silent_risk_streak}/{SILENT_RISK_LIMIT}"
+        f"SILENT_RISK_SIGNAL endpoint={endpoint} consecutive={_silent_risk_streak}/{limit}"
     )
-    if _silent_risk_streak >= SILENT_RISK_LIMIT:
+    if _silent_risk_streak >= limit:
         raise DataFetchError("ACCOUNT_VERIFY: silent empty responses")
 
 
@@ -61,3 +69,4 @@ def silent_risk_streak() -> int:
 
 def reset_silent_risk() -> None:
     record_content_ok()
+    set_single_detail_target(False)
