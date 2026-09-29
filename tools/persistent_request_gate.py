@@ -18,18 +18,22 @@ from pathlib import Path
 from uuid import uuid4
 
 
-def jitter_factor(jitter):
-    """Random pacing multiplier in [1-jitter, 1+jitter], never below 0.5; 0 disables."""
+def jitter_factor(jitter, *, lengthen_only=False):
+    """Random pacing multiplier in [1-jitter, 1+jitter], never below 0.5; 0 disables.
+
+    lengthen_only keeps the multiplier in [1, 1+jitter] for limits that must never shrink.
+    """
     jitter = float(jitter or 0)
     if not math.isfinite(jitter) or jitter <= 0:
         return 1.0
-    return max(0.5, random.uniform(1 - jitter, 1 + jitter))
+    return max(0.5, random.uniform(1.0 if lengthen_only else 1 - jitter, 1 + jitter))
 
 
 class RequestScheduler:
     def __init__(self, db_path, *, platform='dy', min_interval=2.0, per_minute=30,
                  max_concurrency=1, media_interval=5.0, cooldown_seconds=300.0,
-                 jitter=0.0, replace_policy=False, clock=time.time, sleeper=time.sleep):
+                 jitter=0.0, lengthen_only_jitter=False, replace_policy=False,
+                 clock=time.time, sleeper=time.sleep):
         if not str(db_path).strip():
             raise ValueError('request scheduler database is required')
         numbers = (min_interval, per_minute, max_concurrency, media_interval, cooldown_seconds)
@@ -42,6 +46,7 @@ class RequestScheduler:
         self.max_concurrency, self.media_interval = int(max_concurrency), float(media_interval)
         self.cooldown_seconds = float(cooldown_seconds)
         self.jitter = float(jitter)
+        self.lengthen_only_jitter = bool(lengthen_only_jitter)
         self._clock, self._sleeper = clock, sleeper
         with self._connect() as c:
             c.execute('BEGIN IMMEDIATE')
@@ -108,7 +113,7 @@ class RequestScheduler:
             times = sorted(x for x in times if x > now - 60)
             # next_at already carries the jittered interval; the timestamp floor
             # admits the shortest jittered gap without undercutting it.
-            floor = max(.5, 1 - self.jitter) if self.jitter > 0 else 1.0
+            floor = max(.5, 1 - self.jitter) if self.jitter > 0 and not self.lengthen_only_jitter else 1.0
             target = max(now, next_at, cooldown, times[-1] + interval * floor if times else now)
             reason = 'cooldown' if cooldown > now else 'interval'
             if len(times) >= per_minute:
@@ -134,7 +139,7 @@ class RequestScheduler:
             times.append(now)
             c.execute('''INSERT INTO request_scheduler_state(platform,next_allowed_at,request_times_json,updated_at) VALUES(?,?,?,?)
                 ON CONFLICT(platform) DO UPDATE SET next_allowed_at=excluded.next_allowed_at,request_times_json=excluded.request_times_json,updated_at=excluded.updated_at''',
-                (self.platform, now + interval * jitter_factor(self.jitter), json.dumps(times), now))
+                (self.platform, now + interval * jitter_factor(self.jitter, lengthen_only=self.lengthen_only_jitter), json.dumps(times), now))
             if operation in ('media', 'media_refresh'):
                 c.execute("INSERT INTO request_scheduler_channels(platform,channel,next_at,last_start) VALUES (?,'media',?,?) ON CONFLICT(platform,channel) DO UPDATE SET next_at=excluded.next_at,last_start=excluded.last_start", (self.platform, now + media_interval, now))
             if token:
@@ -247,4 +252,6 @@ def configured_gate(*, db_path='', min_interval=2.0, per_minute=30,
         per_minute=value('REQUESTS_PER_MINUTE', per_minute, int),
         max_concurrency=value('REQUEST_CONCURRENCY', max_concurrency, int),
         media_interval=value('MEDIA_REQUEST_INTERVAL', media_interval),
-        cooldown_seconds=value('REQUEST_COOLDOWN_SECONDS', cooldown_seconds), jitter=jitter)
+        cooldown_seconds=value('REQUEST_COOLDOWN_SECONDS', cooldown_seconds),
+        # The platform key is the per-IP limit: jitter may only lengthen its interval.
+        jitter=jitter, lengthen_only_jitter=True)

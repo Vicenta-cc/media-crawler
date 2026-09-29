@@ -31,6 +31,15 @@ def is_ok_status(payload) -> bool:
     return isinstance(payload, dict) and payload.get("status_code") in (None, 0, "0")
 
 
+# Explicit "post unavailable" markers (deleted / private / filtered). A detail
+# response carrying any of them is a normal result, not a silent block.
+_UNAVAILABLE_KEYS = ("filter_detail", "filter_reason", "filter_list", "status_msg")
+
+
+def is_unavailable_content(payload) -> bool:
+    return isinstance(payload, dict) and any(payload.get(key) for key in _UNAVAILABLE_KEYS)
+
+
 def record_silent_risk(endpoint: str) -> None:
     global _silent_risk_streak
     _silent_risk_streak += 1

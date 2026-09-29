@@ -365,7 +365,7 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
         headers.setdefault("x-tt-argus", "1")
         res = await self.get("/aweme/v1/web/aweme/detail/", params, headers, operation=operation)
         detail = res.get("aweme_detail")
-        if pacing.is_ok_status(res) and not detail:
+        if pacing.is_ok_status(res) and not detail and not pacing.is_unavailable_content(res):
             pacing.record_silent_risk("aweme_detail")
         elif detail:
             pacing.record_content_ok()

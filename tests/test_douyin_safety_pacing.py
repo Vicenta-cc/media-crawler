@@ -357,3 +357,59 @@ async def test_cli_flags(monkeypatch):
     assert result.account_requests_per_minute == 8
     assert result.account_min_interval == 6.5
     assert result.dy_skip_profile_verify_regex == "官方|新闻"
+
+
+# --- Fix round 1 -------------------------------------------------------------------
+
+@pytest.mark.parametrize("uniform", ["low", "high"])
+def test_platform_gate_jitter_never_shortens_min_interval(tmp_path, monkeypatch, uniform):
+    monkeypatch.setattr(gate_module.random, "uniform", lambda a, b: a if uniform == "low" else b)
+    monkeypatch.setattr(config, "DY_REQUEST_SCHEDULER_DB", "")
+    monkeypatch.setenv("MEDIACRAWLER_REQUEST_SCHEDULER_DB", str(tmp_path / "platform.sqlite3"))
+    gate = gate_module.configured_gate(min_interval=2.0, per_minute=1000, media_interval=0, jitter=0.4)
+    now = [100.0]
+    gate.state._clock = lambda: now[0]
+    assert gate.state.try_acquire()[0] == 0
+    delay = gate.state.try_acquire()[0]
+    assert delay >= 2.0
+    assert delay == pytest.approx(2.0 if uniform == "low" else 2.8)
+
+
+def test_platform_gate_wait_is_always_at_least_min_interval(tmp_path, monkeypatch):
+    monkeypatch.setenv("MEDIACRAWLER_REQUEST_SCHEDULER_DB", str(tmp_path / "platform.sqlite3"))
+    gate = gate_module.configured_gate(min_interval=2.0, per_minute=100000, media_interval=0, jitter=0.4)
+    now = [100.0]
+    gate.state._clock = lambda: now[0]
+    for _ in range(200):
+        assert gate.state.try_acquire()[0] == 0
+        delay = gate.state.try_acquire()[0]
+        assert 2.0 <= delay <= 2.8
+        now[0] += delay
+
+
+def test_lengthen_only_jitter_factor_bounds():
+    samples = [jitter_factor(0.4, lengthen_only=True) for _ in range(500)]
+    assert min(samples) >= 1.0 and max(samples) <= 1.4
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("payload", [
+    {"status_code": 0, "filter_detail": {"filter_reason": "deleted", "aweme_id": "1"}},
+    {"status_code": 0, "aweme_detail": None, "filter_reason": "private"},
+    {"status_code": 0, "filter_list": [{"aweme_id": "1", "filter_reason": "unavailable"}]},
+    {"status_code": 0, "status_msg": "作品已删除"},
+])
+async def test_detail_unavailable_post_is_not_a_signal(payload):
+    for aweme_id in ("1", "2", "3"):
+        assert await bare_client(payload).get_video_by_id(aweme_id) == {}
+    assert pacing.silent_risk_streak() == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("payload", [
+    {"status_code": 0},
+    {"status_code": 0, "aweme_detail": None, "filter_list": [], "status_msg": ""},
+])
+async def test_bare_empty_detail_is_still_a_signal(payload):
+    await bare_client(payload).get_video_by_id("1")
+    assert pacing.silent_risk_streak() == 1
