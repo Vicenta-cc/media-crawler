@@ -23,6 +23,7 @@ import re
 import sqlite3
 import json
 from pathlib import Path
+from urllib.parse import urlsplit
 import os
 from contextlib import asynccontextmanager
 from asyncio import Task
@@ -55,7 +56,7 @@ from tools.collection_status import (
 from var import crawler_type_var, source_keyword_var
 
 from .client import DouYinClient
-from .exception import DataFetchError, MediaDownloadError, PlatformRateLimitedError
+from .exception import BrowserInitializationError, DataFetchError, MediaDownloadError, PlatformRateLimitedError
 from .field import PublishTimeType, SearchSortType
 from .help import parse_video_info_from_url, parse_creator_info_from_url
 from .login import DouYinLogin
@@ -160,14 +161,9 @@ class DouYinCrawler(AbstractCrawler):
                 background_headless=background_headless,
             )
             await self.apply_account_auth_state(self.browser_context)
+            self._page_retry_count = 0
             await self._open_index_page()
-
-            self.dy_client = await self.create_douyin_client(httpx_proxy_format)
-            need_login = not await self.dy_client.pong(browser_context=self.browser_context)
-            if need_login:
-                # Account management owns login; background jobs never reopen a
-                # different browser or silently switch to an interactive login.
-                self.raise_account_auth_invalid()
+            await self._check_login_with_page_recovery(httpx_proxy_format)
             crawler_type_var.set(config.CRAWLER_TYPE)
             if config.CRAWLER_TYPE == "search":
                 # Search for notes and retrieve their comment information.
@@ -258,24 +254,91 @@ class DouYinCrawler(AbstractCrawler):
         text = str(exc)
         return any(code in text for code in cls._TRANSIENT_NET_ERRORS)
 
-    async def _open_index_page(self) -> None:
-        self.context_page = await self.browser_context.new_page()
+    async def _retry_page_initialization(self) -> bool:
+        # Navigation and login-check recovery share ONE budget for this startup.
         retries = max(0, int(getattr(config, "DY_PAGE_LOAD_RETRIES", 2)))
+        used = getattr(self, "_page_retry_count", 0)
+        if used >= retries:
+            return False
+        self._page_retry_count = used + 1
         backoff = max(0.0, float(getattr(config, "DY_PAGE_LOAD_RETRY_BACKOFF_SECONDS", 3.0)))
-        attempt = 0
+        await asyncio.sleep(backoff * self._page_retry_count)
+        return True
+
+    async def _page_diagnostic(self, reason: str) -> dict:
+        # Never log query strings, fragments, page text, cookies or storage values.
+        page = self.context_page
+        url = urlsplit(str(page.url))
+        path = url.path.lower()
+        restricted = any(word in path for word in ("captcha", "verify", "challenge", "login", "passport"))
+        data = {
+            "reason": reason, "scheme": url.scheme, "host": url.hostname,
+            "page_kind": "restricted" if restricted else "home" if path in ("", "/") else "other",
+            "http_status": getattr(self, "_index_http_status", None),
+            "retries_used": getattr(self, "_page_retry_count", 0),
+        }
+        try:
+            state = await page.evaluate("() => ({origin: window.origin, readyState: document.readyState})")
+            if isinstance(state, dict):
+                origin = str(state.get("origin", ""))
+                parsed = urlsplit(origin)
+                data["origin"] = "null" if origin == "null" else f"{parsed.scheme}://{parsed.hostname}"
+                ready = state.get("readyState")
+                data["ready_state"] = ready if ready in ("loading", "interactive", "complete") else "unknown"
+        except PlaywrightError:
+            data["diagnostic_unavailable"] = True
+        utils.logger.warning("BROWSER_INIT_DIAGNOSTIC: " + json.dumps(data, ensure_ascii=False))
+        return data
+
+    async def _open_index_page(self, *, reuse_page: bool = False) -> None:
+        if not reuse_page:
+            self.context_page = await self.browser_context.new_page()
         while True:
+            self._index_http_status = None
             try:
-                await self.context_page.goto(self.index_url)
+                response = await self.context_page.goto(self.index_url)
+                self._index_http_status = response.status if response else None
+                if self._index_http_status == 429:
+                    raise PlatformRateLimitedError("PLATFORM_RATE_LIMITED: homepage HTTP 429")
+                if self._index_http_status in (401, 403):
+                    raise DataFetchError("ACCOUNT_VERIFY: homepage access denied")
                 return
             except PlaywrightError as exc:
-                if attempt >= retries or not self._is_transient_page_load_error(exc):
+                if not self._is_transient_page_load_error(exc):
                     raise
-                attempt += 1
-                utils.logger.warning(
-                    f"[DouYinCrawler._open_index_page] transient network error, retry {attempt}/{retries}: "
-                    f"{str(exc).splitlines()[0][:160]}"
+                reason = next((code for code in self._TRANSIENT_NET_ERRORS if code in str(exc)), type(exc).__name__)
+                await self._page_diagnostic(reason)
+                if not await self._retry_page_initialization():
+                    raise BrowserInitializationError("navigation_retry_exhausted") from None
+
+    async def _check_login_with_page_recovery(self, httpx_proxy_format) -> None:
+        while True:
+            try:
+                self.dy_client = await self.create_douyin_client(httpx_proxy_format)
+                if not await self.dy_client.pong(browser_context=self.browser_context):
+                    self.raise_account_auth_invalid()
+                return
+            except PlaywrightError as exc:
+                # Narrow recovery: do not swallow closed browsers, cancellation,
+                # arbitrary JS errors, or account/platform rejection signals.
+                message = str(exc)
+                storage_denied = "localStorage" in message and (
+                    "SecurityError" in message
+                    or "Access is denied for this document" in message
+                    or ("document is sandboxed" in message and "allow-same-origin" in message)
                 )
-                await asyncio.sleep(backoff * attempt)
+                if not storage_denied:
+                    raise
+                data = await self._page_diagnostic("local_storage_security_error")
+                known_page = (
+                    data["scheme"] == "https" and data["host"] in ("www.douyin.com", "douyin.com")
+                    and data["page_kind"] == "home"
+                ) or data["scheme"] in ("about", "chrome-error")
+                if (not known_page or data.get("diagnostic_unavailable")
+                        or data["http_status"] in (401, 403, 429)
+                        or not await self._retry_page_initialization()):
+                    raise BrowserInitializationError("local_storage_unavailable") from None
+                await self._open_index_page(reuse_page=True)
 
     async def _close_current_browser(self) -> None:
         if self.cdp_manager:

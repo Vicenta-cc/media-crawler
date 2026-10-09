@@ -40,3 +40,10 @@ class MediaDownloadError(Exception):
 
 class PlatformRateLimitedError(DataFetchError):
     """Platform-wide cooldown: propagate without account rotation or media fallback."""
+
+
+class BrowserInitializationError(RuntimeError):
+    """Startup failed before collection; never evidence of an expired account."""
+
+    def __init__(self, reason: str):
+        super().__init__(f"BROWSER_INITIALIZATION_FAILED: {reason}")
