@@ -255,13 +255,43 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
             payload = None
 
         if self._requires_verification(response, payload):
-            utils.logger.error("ACCOUNT_VERIFY: platform request requires verification")
-            raise DataFetchError("ACCOUNT_VERIFY")
+            # Preserve the stop/cooldown signal, but do not describe every HTTP
+            # denial as proof of a CAPTCHA. Never log raw bodies, URLs or cookies.
+            diagnostic = self._rejection_diagnostic(response, payload, url)
+            message = "ACCOUNT_VERIFY: " + json.dumps(diagnostic, ensure_ascii=False)
+            utils.logger.error(message)
+            raise DataFetchError(message)
         if response.status_code >= 400:
             raise DataFetchError(f"HTTP {response.status_code}")
         if payload is None:
             raise DataFetchError("platform response is empty or not valid JSON")
         return payload
+
+    @staticmethod
+    def _rejection_diagnostic(response: httpx.Response, payload: Any, url: str) -> Dict:
+        endpoints = {
+            "/aweme/v1/web/user/profile/other/": "creator_profile",
+            "/aweme/v1/web/aweme/post/": "creator_posts",
+            "/aweme/v1/web/aweme/detail/": "post_detail",
+        }
+        reason = "verification_signal"
+        if response.status_code in (401, 403):
+            reason = "http_unauthorized" if response.status_code == 401 else "http_forbidden"
+            # Only recognize known gateway messages, not arbitrary user content.
+            body = response.text.strip().casefold()
+            if body == "blocked by argussecurityplugin uifid not found":
+                reason = "gateway_missing_uifid"
+            elif body == "blocked by argussecurityplugin signature not found":
+                reason = "gateway_missing_signature"
+        data = payload if isinstance(payload, dict) else {}
+        status = data.get("status_code")
+        return {
+            "endpoint": endpoints.get(urllib.parse.urlsplit(str(url)).path, "other"),
+            "http_status": response.status_code,
+            "platform_status": status if type(status) is int else None,
+            "reason": reason,
+            "body_bytes": len(response.content),
+        }
 
     async def get(self, uri: str, params: Optional[Dict] = None, headers: Optional[Dict] = None, *, operation="api"):
         """
@@ -531,7 +561,23 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
             "locate_query": "false",
             "publish_video_strategy_type": 2,
         }
-        return await self.get(uri, params)
+        # Use the current logged-in account's identity on every page, as for
+        # detail requests. Never synthesize identity or reuse another account's.
+        headers = copy.copy(self.headers)
+        headers.pop("Origin", None)
+        headers.pop("uifid", None)
+        uifid = self.cookie_dict.get("UIFID") or self.cookie_dict.get("UIFID_TEMP", "")
+        fingerprint = self.cookie_dict.get("s_v_web_id", "")
+        if uifid:
+            params["uifid"] = headers["uifid"] = uifid
+        if fingerprint:
+            params.update(verifyFp=fingerprint, fp=fingerprint)
+        # Match upstream's compatibility header and our existing detail path.
+        # This constant is not a generated signature. Keep protected responses
+        # fatal if the gateway rejects it; never retry a rejection here.
+        headers.setdefault("x-tt-argus", "1")
+        headers["Referer"] = "https://www.douyin.com/user/" + urllib.parse.quote(sec_user_id, safe="")
+        return await self.get(uri, params, headers=headers)
 
     async def get_all_user_aweme_posts(self, sec_user_id: str, callback: Optional[Callable] = None):
         result = []
@@ -579,7 +625,8 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
                                         timeout=self.timeout, follow_redirects=True)
             final_host = response.url.host
             if response.status_code != 200:
-                raise MediaDownloadError("media_http_error", response.status_code)
+                raise MediaDownloadError("media_http_error", response.status_code,
+                                         retryable=response.status_code in {500, 502, 503, 504})
             mime = response.headers.get("content-type", "").split(";")[0].lower()
             if not response.content or mime.startswith("text/") or mime in {
                 "application/json", "application/xml", "application/xhtml+xml"
@@ -598,7 +645,9 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
             if raise_on_error:
                 if isinstance(exc, MediaDownloadError):
                     raise
-                raise MediaDownloadError(type(exc).__name__) from None
+                raise MediaDownloadError(type(exc).__name__, retryable=isinstance(
+                    exc, (httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError)
+                )) from None
             return None
 
     async def resolve_short_url(self, short_url: str) -> str:

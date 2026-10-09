@@ -913,7 +913,7 @@ class DouYinCrawler(AbstractCrawler):
                 failed_indices.append(source_index)
                 continue
             try:
-                content = await self.dy_client.get_aweme_media(url, raise_on_error=True)
+                content = await self._download_media_with_retry(url, [2])
             except MediaDownloadError:
                 failed_indices.append(source_index)
                 continue
@@ -935,6 +935,25 @@ class DouYinCrawler(AbstractCrawler):
             )
             raise CollectionIncompleteError("COLLECTION_INCOMPLETE: incomplete_images")
 
+    async def _download_media_with_retry(self, url: str, budget: list[int]):
+        """At most one transient retry per URL; callers share the total budget."""
+        for attempt in range(2):
+            if budget[0] <= 0:
+                raise MediaDownloadError("media_retry_budget_exhausted")
+            budget[0] -= 1
+            try:
+                return await self.dy_client.get_aweme_media(url, raise_on_error=True)
+            except MediaDownloadError as exc:
+                if exc.status_code == 429:
+                    raise PlatformRateLimitedError("PLATFORM_RATE_LIMITED: media HTTP 429") from exc
+                if not exc.retryable or attempt or budget[0] <= 0:
+                    raise
+                utils.logger.warning(
+                    f"MEDIA_TRANSIENT_RETRY reason={exc} retry=1 remaining_budget={budget[0]}"
+                )
+                # The normal account/IP request gate still applies to the next request.
+                await asyncio.sleep(1.0)
+
     async def get_aweme_video(self, aweme_item: Dict):
         """
         get aweme videos. please use get_aweme_media
@@ -951,11 +970,15 @@ class DouYinCrawler(AbstractCrawler):
         if not urls:
             raise MediaDownloadError("missing_video_url")
         limit = max(1, min(3, int(config.DY_MEDIA_MAX_URL_ATTEMPTS)))
+        # Shared by primary/alternate URLs, transient retries and the detail refresh.
+        budget = [5]
         for generation in range(2):
             refresh_needed = False
             for url in urls[:limit]:
+                if budget[0] <= 0:
+                    break
                 try:
-                    content = await self.dy_client.get_aweme_media(url, raise_on_error=True)
+                    content = await self._download_media_with_retry(url, budget)
                 except MediaDownloadError as exc:
                     if exc.status_code == 429:
                         raise PlatformRateLimitedError(
@@ -966,10 +989,11 @@ class DouYinCrawler(AbstractCrawler):
                 if content:
                     await douyin_store.update_dy_aweme_video(aweme_id, content, "video.mp4")
                     return
-            if generation or not refresh_needed or not config.DY_MEDIA_REFRESH_ON_FAILURE:
+            if generation or not refresh_needed or not config.DY_MEDIA_REFRESH_ON_FAILURE or budget[0] <= 1:
                 break
             # Refresh only after candidate exhaustion, at most once. Reuse the same account.
             try:
+                budget[0] -= 1
                 fresh = await self.dy_client.get_video_by_id(
                     aweme_id, operation="media_refresh"
                 )

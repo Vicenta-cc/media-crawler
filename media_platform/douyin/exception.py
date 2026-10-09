@@ -32,9 +32,10 @@ class IPBlockError(RequestError):
 class MediaDownloadError(Exception):
     """Resource failure, deliberately separate from account/API verification."""
 
-    def __init__(self, reason: str, status_code: int | None = None):
+    def __init__(self, reason: str, status_code: int | None = None, *, retryable: bool = False):
         super().__init__(reason)
         self.status_code = status_code
+        self.retryable = retryable
 
 
 class PlatformRateLimitedError(DataFetchError):
