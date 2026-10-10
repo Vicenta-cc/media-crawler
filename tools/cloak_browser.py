@@ -1,6 +1,7 @@
 """Account-bound persistent CloakBrowser contexts; no shared/default account."""
 from __future__ import annotations
 
+import asyncio
 import fcntl
 import hashlib
 import os
@@ -32,7 +33,22 @@ def profile_for(account_id: str, root: Path, version: str) -> dict:
     return {"directory": directory, "seed": row[0], "version": row[1]}
 
 
-async def launch_account_context(account_id: str, root: Path, *, headless: bool, proxy=None):
+async def launch_account_context(account_id: str, root: Path, *, headless: bool, proxy=None,
+                                 route_snapshot=None, bound_proxy_session=None, probe_page_hook=None,
+                                 browser_args=None):
+    from tools.collection_route import CollectionRouteError, derive_profile_key
+    if route_snapshot is not None:
+        if route_snapshot.account_id != account_id or route_snapshot.profile_key != derive_profile_key(account_id):
+            raise CollectionRouteError('PROXY_CONFIG_INVALID')
+        route_snapshot.require_not_expired(allow_unknown=True)
+        proxy = route_snapshot.playwright_proxy()
+        if bound_proxy_session is None:
+            from tools.bound_proxy import BoundProxySession
+            bound_proxy_session = BoundProxySession(route_snapshot)
+        elif bound_proxy_session.snapshot != route_snapshot:
+            raise CollectionRouteError('PROXY_CONFIG_INVALID')
+    elif bound_proxy_session is not None:
+        raise CollectionRouteError('PROXY_CONFIG_INVALID')
     from cloakbrowser import launch_persistent_context_async
     from cloakbrowser.config import get_chromium_version
 
@@ -42,26 +58,45 @@ async def launch_account_context(account_id: str, root: Path, *, headless: bool,
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
         lock.close()
+        if route_snapshot is not None:
+            raise CollectionRouteError('PROXY_BUSY') from None
         raise RuntimeError("CloakBrowser account profile is already in use") from None
     try:
         context = await launch_persistent_context_async(
             user_data_dir=profile["directory"], headless=headless, proxy=proxy,
-            args=[f"--fingerprint={profile['seed']}"],
+            args=[f"--fingerprint={profile['seed']}", *(browser_args or [])],
             browser_version=profile["version"], humanize=False, geoip=False,
             accept_downloads=True,
         )
-    except BaseException:
+    except BaseException as exc:
         lock.close()
+        if isinstance(exc, asyncio.CancelledError):
+            raise
+        if route_snapshot is not None:
+            raise CollectionRouteError('PROXY_UNAVAILABLE') from None
         raise
     close = context.close
 
     async def close_locked(*args, **kwargs):
         try:
+            if bound_proxy_session is not None:
+                await bound_proxy_session.close()
             await close(*args, **kwargs)
         finally:
             lock.close()
 
     context.close = close_locked
+    if bound_proxy_session is not None:
+        try:
+            # Persistent profiles can restore tabs; stop them before probing.
+            for page in list(context.pages):
+                await page.close()
+            await bound_proxy_session.open_context(context, on_probe_page=probe_page_hook)
+            profile['bound_proxy_session'] = bound_proxy_session
+            context._bound_proxy_session = bound_proxy_session
+        except BaseException:
+            await context.close()
+            raise
     return context, profile
 
 
@@ -80,6 +115,11 @@ async def prepare_account_login(context, profile):
         "www.douyin.com", "douyin.com", "creator.douyin.com", "live.douyin.com", "douhot.douyin.com"))
     origins.update("https://" + cookie["domain"].lstrip(".")
                    for cookie in state.get("cookies", []) if cookie.get("domain"))
+    bound_session = profile.get('bound_proxy_session')
+    if bound_session is not None:
+        from urllib.parse import urlsplit
+        echo = urlsplit(bound_session.echo_url)
+        origins.discard(echo.scheme + '://' + echo.netloc)
     for page in list(context.pages):
         await page.close()
     await context.clear_cookies()

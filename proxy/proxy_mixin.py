@@ -59,6 +59,10 @@ class ProxyRefreshMixin:
         Check if proxy has expired, automatically refresh if so
         Call this method before each request to ensure proxy is valid
         """
+        bound_session = getattr(self, '_bound_proxy_session', None)
+        if bound_session is not None:
+            bound_session.check_stop()
+            return  # A browser/API pair may only change in maintenance together.
         if self._proxy_ip_pool is None:
             return
 
@@ -68,10 +72,7 @@ class ProxyRefreshMixin:
             )
             new_proxy = await self._proxy_ip_pool.get_or_refresh_proxy()
             # Update httpx proxy URL
-            if new_proxy.user and new_proxy.password:
-                self.proxy = f"http://{new_proxy.user}:{new_proxy.password}@{new_proxy.ip}:{new_proxy.port}"
-            else:
-                self.proxy = f"http://{new_proxy.ip}:{new_proxy.port}"
+            self.proxy = utils.format_proxy_info(new_proxy)[1]
             utils.logger.info(
                 f"[{self.__class__.__name__}._refresh_proxy_if_expired] New proxy: {new_proxy.ip}:{new_proxy.port}"
             )
