@@ -186,7 +186,7 @@ class BoundRoute:
         return "http://" + credentials + '@' + self.proxy_server[len('http://'):]
 
     def require_not_expired(self, now=None, *, allow_unknown=False):
-        now = time.time() if now is None else now
+        now = _timestamp(time.time() if now is None else now, nullable=False)
         if self.expires_at is None:
             if not allow_unknown:
                 raise CollectionRouteError("PROXY_UNAVAILABLE")
@@ -356,7 +356,7 @@ def route_ack(snapshot, *, owner_id, lease_version, context_id=None, now=None, t
     """Create the redacted ACK only after owner/version/TTL checks."""
     if not snapshot.managed or owner_id != snapshot.owner_id or lease_version != snapshot.lease_version:
         raise CollectionRouteError('PROXY_REVISION_MISMATCH')
-    now = time.time() if now is None else float(now)
+    now = _timestamp(time.time() if now is None else now, nullable=False)
     snapshot.require_not_expired(now)
     if context_id is not None and context_id != snapshot.context_id:
         raise CollectionRouteError('PROXY_REVISION_MISMATCH')
@@ -486,7 +486,7 @@ def require_probe_receipt(snapshot, receipt, context_id, *, now=None, ttl=300):
     snapshot.require_not_expired(now, allow_unknown=True)
     if (not isinstance(receipt, ProbeReceipt) or receipt.proxy_id != snapshot.proxy_id
             or receipt.config_revision != snapshot.config_revision or receipt.context_id != context_id
-            or (snapshot.managed and receipt.exit_generation != snapshot.exit_generation)):
+            or (snapshot.managed and (receipt.exit_generation != snapshot.exit_generation or context_id != snapshot.context_id))):
         raise CollectionRouteError('PROXY_REVISION_MISMATCH')
     ip = canonical_exit_ip(receipt.ip)
     at = _timestamp(receipt.observed_at, nullable=False)
@@ -542,7 +542,7 @@ class ProbeGuard:
         with self._lock:
             if self._baseline is None or receipt.ip != self._baseline:
                 raise CollectionRouteError('PROXY_EXIT_CHANGED')
-        return derive_scope_ids(self.snapshot.platform, self.snapshot.account_id, self.snapshot.proxy_id, receipt.ip)
+        return self.snapshot.scope_ids if self.snapshot.route_mode=='direct_degraded' else derive_scope_ids(self.snapshot.platform, self.snapshot.account_id, self.snapshot.proxy_id, receipt.ip)
 
 
 def validate_collection_route_provenance(value):

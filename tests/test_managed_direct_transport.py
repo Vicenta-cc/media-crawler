@@ -60,3 +60,23 @@ def test_ack_rejects_nonfinite_and_bool_fields(tmp_path,field,value):
     ack=route.route_ack(snap,owner_id=snap.owner_id,lease_version=1,ttl=60)
     ack[field]=value
     with pytest.raises(route.CollectionRouteError): snap.require_managed_ack(ack)
+
+
+def test_direct_service_budget_preserves_existing_platform_policy_and_429(tmp_path):
+    import sqlite3
+    from tools.bound_proxy import BoundProxySession
+    from tools.persistent_request_gate import RequestScheduler
+    snap=direct_snapshot(tmp_path)
+    platform=RequestScheduler(snap.scheduler_db_path,platform='dy',min_interval=2,per_minute=30,max_concurrency=1,media_interval=5)
+    platform.enter_cooldown('http_429',30)
+    ack=route.route_ack(snap,owner_id=snap.owner_id,lease_version=1,ttl=60)
+    value=BoundProxySession(snap,ack=ack,echo_url='https://echo.invalid/ip',budget_id='direct-policy',
+        policy=dict(min_interval=2,per_minute=30,max_concurrency=1,media_interval=5,cooldown_seconds=30))
+    value.receipt=route.ProbeReceipt(snap.proxy_id,snap.config_revision,snap.context_id,snap.observed_exit_ip,time.time(),snap.exit_generation)
+    value.context_id=snap.context_id
+    value._make_gate()
+    with sqlite3.connect(snap.scheduler_db_path) as db:
+        policies={key:json.loads(body) for key,body in db.execute('SELECT platform,limits_json FROM request_scheduler_policy')}
+    assert policies['dy'][:2]==[2.0,30]
+    assert policies['dy:service_exit:'+snap.observed_exit_ip][:2]==[9.0,6]
+    assert platform.snapshot()['cooldown_until']>time.time()+20

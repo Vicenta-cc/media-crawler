@@ -236,10 +236,12 @@ def _try_reserve_scopes(db_path, scope_ids, operation, lease_seconds, now, jitte
             row = c.execute('SELECT generation,observed_at,paused_until,pause_reason FROM safety.crawler_shared_exits WHERE exit_key=?', (safety_fence['exit_ip'],)).fetchone()
             admission = c.execute('SELECT account_id,exit_key,generation,state FROM safety.crawler_route_admissions WHERE operation_id=?', (safety_fence['operation_id'],)).fetchone()
             account = c.execute('SELECT recovery_claim,recovery_state FROM safety.crawler_accounts WHERE id=?', (safety_fence['account_id'],)).fetchone()
-            recovery = bool(account and safety_fence.get('recovery_claim') and account[0] == safety_fence['recovery_claim'] and account[1] == 'claimed')
+            recovery = bool(account and safety_fence.get('recovery_claim') and account[0] == safety_fence['recovery_claim'] and account[1] in {'claimed','manual_claimed'})
+            if recovery and account[1]=='manual_claimed':
+                recovery=bool(c.execute("SELECT 1 FROM safety.crawler_manual_recovery_operations WHERE account_id=? AND claim=? AND owner_id=? AND state='claimed'",(safety_fence['account_id'],safety_fence['recovery_claim'],safety_fence['owner_id'])).fetchone())
             if (not row or row[0] != safety_fence['generation'] or (row[3] and not recovery)
                     or not 0 <= now - row[1] <= safety_fence['ttl']
-                    or (row[2] is not None and row[2] > now)
+                    or (row[2] is not None and row[2] > now and not (recovery and account[1]=='manual_claimed'))
                     or not admission or tuple(admission) != (safety_fence['account_id'], safety_fence['exit_ip'], safety_fence['generation'], 'active')):
                 raise RuntimeError('ACCOUNT_CHALLENGE')
         for scope in scopes:

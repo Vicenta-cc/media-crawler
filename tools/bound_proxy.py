@@ -7,6 +7,7 @@ import json
 import math
 import os
 import sqlite3
+import selectors
 import time
 from contextlib import asynccontextmanager
 from urllib.parse import urlsplit
@@ -216,19 +217,20 @@ def obtain_route_ack(snapshot, *, env=None, timeout=5.0, previous_ack=None):
         if previous_ack is not None:
             request = dict(type='route_renew', operation_id=uuid4().hex, route_operation_id=snapshot.operation_id, owner_id=snapshot.owner_id, lease_version=previous_ack['lease_version'])
         os.write(write_fd, (json.dumps(request, allow_nan=False) + '\n').encode())
-        import select
         deadline = time.monotonic()+timeout
         raw = bytearray()
-        while len(raw) < 4096:
-            remaining=deadline-time.monotonic()
-            if remaining <= 0 or not select.select([read_fd], [], [], remaining)[0]:
-                _error('PROXY_UNAVAILABLE')
-            chunk = os.read(read_fd, 1)
-            if chunk == b'\n':
-                return snapshot.require_managed_ack(json.loads(raw), lease_version=snapshot.lease_version if previous_ack is None else previous_ack['lease_version']+1)
-            if not chunk:
-                break
-            raw.extend(chunk)
+        with selectors.DefaultSelector() as poll:
+            poll.register(read_fd,selectors.EVENT_READ)
+            while len(raw) < 4096:
+                remaining=deadline-time.monotonic()
+                if remaining <= 0 or not poll.select(remaining):
+                    _error('PROXY_UNAVAILABLE')
+                chunk = os.read(read_fd, 1)
+                if chunk == b'\n':
+                    return snapshot.require_managed_ack(json.loads(raw), lease_version=snapshot.lease_version if previous_ack is None else previous_ack['lease_version']+1)
+                if not chunk:
+                    break
+                raw.extend(chunk)
         _error()
     except (KeyError, ValueError, OSError, TypeError):
         _error('PROXY_REVISION_MISMATCH')
@@ -334,6 +336,14 @@ class BoundProxySession:
                      observed_exit_ip=receipt.ip if receipt else None,
                      observed_at=receipt.observed_at if receipt else time.time())
         print('COLLECTION_ROUTE_EVENT ' + json.dumps(event, separators=(',', ':'), allow_nan=False), flush=True)
+        if self.snapshot.managed and code != 'ROUTE_OBSERVED':
+            try:
+                fd=int(os.environ['MEDIACRAWLER_PROXY_RECEIPT_FD'])
+                data=(json.dumps({'type':'route_fault','event':event},allow_nan=False)+'\n').encode()
+                os.set_blocking(fd,False)
+                os.write(fd,data)
+            except (OSError,ValueError,KeyError):
+                pass
 
     def fail(self, code):
         error = CollectionRouteError(code)
@@ -494,9 +504,11 @@ class BoundProxySession:
                 row = db.execute('SELECT generation,observed_at,paused_until,pause_reason FROM safety.crawler_shared_exits WHERE exit_key=?', (key,)).fetchone()
                 admission = db.execute('SELECT account_id,exit_key,generation,state FROM safety.crawler_route_admissions WHERE operation_id=?', (self.snapshot.operation_id,)).fetchone()
                 account = db.execute('SELECT recovery_claim,recovery_state FROM safety.crawler_accounts WHERE id=?',(self.snapshot.account_id,)).fetchone()
-                recovery = bool(account and self.snapshot.recovery_claim and account[0] == self.snapshot.recovery_claim and account[1] == 'claimed')
+                recovery = bool(account and self.snapshot.recovery_claim and account[0] == self.snapshot.recovery_claim and account[1] in {'claimed','manual_claimed'})
+                if recovery and account[1]=='manual_claimed':
+                    recovery=bool(db.execute("SELECT 1 FROM safety.crawler_manual_recovery_operations WHERE account_id=? AND claim=? AND owner_id=? AND state='claimed'",(self.snapshot.account_id,self.snapshot.recovery_claim,self.snapshot.owner_id)).fetchone())
                 if (not row or row[0] != self.snapshot.exit_generation or (row[3] and not recovery)
-                        or not 0 <= now-row[1] <= 300 or (row[2] is not None and row[2] > now)
+                        or not 0 <= now-row[1] <= 300 or (row[2] is not None and row[2] > now and not (recovery and account[1]=='manual_claimed'))
                         or not admission or tuple(admission) != (self.snapshot.account_id,key,self.snapshot.exit_generation,'active')):
                     _error('PROXY_UNAVAILABLE')
             for previous, pid in db.execute('SELECT token,pid FROM collection_browser_requests WHERE active=1').fetchall():
@@ -652,7 +664,9 @@ class BoundProxySession:
                 try:
                     browser_ip = await self._browser_sample()
                 except CollectionRouteError as browser_error:
-                    if browser_error.code == 'PROXY_UNAVAILABLE':
+                    if browser_error.code=='PROXY_AUTH_FAILED' and not self.snapshot.managed:
+                        raise browser_error from None
+                    if browser_error.code in {'PROXY_UNAVAILABLE','PROXY_AUTH_FAILED'}:
                         # A generic Chromium HTTP failure doesn't identify407.
                         # Use the already-reserved pair's HTTP attempt for exact
                         # diagnosis; never relabel generic tunnel failures auth.
@@ -661,6 +675,8 @@ class BoundProxySession:
                         except CollectionRouteError as http_error:
                             if http_error.code in {'PROXY_AUTH_FAILED', 'PROXY_CONNECTION_REFUSED', 'PROXY_TRANSPORT_FAILED'}:
                                 raise http_error from None
+                        if browser_error.code == 'PROXY_AUTH_FAILED':
+                            raise CollectionRouteError('PROXY_UNAVAILABLE') from None
                     raise browser_error from None
                 http_ip = await self._http_sample()
                 if self.maintenance_only:
@@ -697,7 +713,7 @@ class BoundProxySession:
             return None
         return dict(db_path=self.snapshot.safety_db_path, exit_ip=self.snapshot.observed_exit_ip,
             account_id=self.snapshot.account_id, generation=self.snapshot.exit_generation,
-            operation_id=self.snapshot.operation_id, ttl=300, recovery_claim=self.snapshot.recovery_claim)
+            operation_id=self.snapshot.operation_id, ttl=300, recovery_claim=self.snapshot.recovery_claim, owner_id=self.snapshot.owner_id)
 
     def _make_gate(self):
         from tools.persistent_request_gate import RequestScheduler, MultiScopeGate, configured_gate
@@ -714,6 +730,8 @@ class BoundProxySession:
                 for scope in scopes:
                     if scope in rows:
                         limits = json.loads(rows[scope])
+                    elif scope.startswith('dy:service_exit:') and self.snapshot.route_mode=='direct_degraded':
+                        limits=[max(9.0,baseline[0]),min(6,baseline[1]),baseline[2],baseline[3]]
                     elif scope.startswith('dy:account:'):
                         # A new account may have stricter slow-mode limits than
                         # globaldy. Never silently assign it the global quota.
@@ -758,13 +776,14 @@ class BoundProxySession:
             account_policy = policy
         scopes = self.guard.require_business(self.receipt, self.context_id)
         if self.snapshot.route_mode == 'direct_degraded':
-            policy = {**policy, 'min_interval': max(9.0, policy['min_interval']), 'per_minute': min(6, policy['per_minute'])}
             account_policy = {**account_policy, 'min_interval': max(9.0, account_policy['min_interval']), 'per_minute': min(6, account_policy['per_minute'])}
         try:
             for scope in scopes:
+                scope_policy = account_policy if scope.startswith('dy:account:') else policy
+                if self.snapshot.route_mode=='direct_degraded' and scope.startswith('dy:service_exit:'):
+                    scope_policy={**policy,'min_interval':max(9.0,policy['min_interval']),'per_minute':min(6,policy['per_minute'])}
                 RequestScheduler(self.snapshot.scheduler_db_path, platform=scope,
-                                 **(account_policy if scope.startswith('dy:account:') else policy),
-                                 replace_policy=scope.startswith('dy:account:'))
+                                 **scope_policy, replace_policy=scope.startswith('dy:account:'))
         except (ValueError, sqlite3.Error):
             raise CollectionRouteError('SCHEDULER_POLICY_CONFLICT') from None
         return MultiScopeGate(self.snapshot.scheduler_db_path, scopes, stop_checker=self.check_stop,
@@ -785,15 +804,20 @@ class BoundProxySession:
     @asynccontextmanager
     async def slot(self, operation='api', *, timeout=60, max_wait=300):
         gate = await self.ensure_business()
-        async with gate.slot(operation, timeout=timeout, max_wait=max_wait) as waited:
-            self.check_stop()
-            self.guard.require_business(self.receipt, self.context_id)
-            if self.trial_limits is not None:
-                try:
-                    self.trial_limits.reserve_operation()
-                except RuntimeError:
-                    raise self.fail('PROBE_BUDGET_EXHAUSTED') from None
-            yield waited
+        try:
+            async with gate.slot(operation, timeout=timeout, max_wait=max_wait) as waited:
+                self.check_stop()
+                self.guard.require_business(self.receipt, self.context_id)
+                if self.trial_limits is not None:
+                    try:
+                        self.trial_limits.reserve_operation()
+                    except RuntimeError:
+                        raise self.fail('PROBE_BUDGET_EXHAUSTED') from None
+                yield waited
+        except RuntimeError as exc:
+            if str(exc)=='ACCOUNT_CHALLENGE':
+                raise CollectionRouteError('PROXY_UNAVAILABLE') from None
+            raise
 
     def enter_cooldown(self, reason, seconds=None):
         if self.maintenance_only:
