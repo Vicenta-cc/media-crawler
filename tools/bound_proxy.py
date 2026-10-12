@@ -70,6 +70,11 @@ def emit_probe_receipt(snapshot, receipt, *, closed=False, env=None):
                       proxy_id=snapshot.proxy_id, binding_revision=snapshot.binding_revision,
                       config_revision=snapshot.config_revision, context_id=receipt.context_id,
                       ip=receipt.ip, observed_at=receipt.observed_at)
+        if snapshot.managed:
+            record.update(operation_id=snapshot.operation_id, lease_id=snapshot.lease_id,
+                          lease_version=snapshot.lease_version, owner_id=snapshot.owner_id,
+                          snapshot_digest=snapshot.snapshot_digest,
+                          exit_generation=snapshot.exit_generation)
         data = (json.dumps(record, separators=(',', ':'), allow_nan=False) + '\n').encode('utf-8')
         if len(data) > 2048:
             return False
@@ -165,8 +170,12 @@ class BoundProxySession:
     def __init__(self, snapshot, *, echo_url=None, budget_id=None, stop_checker=None,
                  ttl=None, max_calls=None, verify=True, http_client_factory=None,
                  policy=None, maintenance_only=False, trial_id=None, reuse_existing_policy=False,
-                 account_policy=None, login_bootstrap=False):
+                 account_policy=None, login_bootstrap=False, ack=None):
         self.snapshot = snapshot
+        # Managed routes are unusable until the App's redacted ACK has been
+        # validated.  This fail-closed check also prevents callers from
+        # falling through to an unmanaged automatic proxy pool.
+        self.snapshot.require_managed_ack(ack)
         if trial_id is not None and not isinstance(trial_id, str):
             _error()
         self._trial_id = trial_id
@@ -519,7 +528,8 @@ class BoundProxySession:
                         _error('PROXY_EXIT_CHANGED')
                     self._maintenance_ip = browser_ip
                     receipt = ProbeReceipt(self.snapshot.proxy_id, self.snapshot.config_revision,
-                                           self.context_id, browser_ip, time.time())
+                                           self.context_id, browser_ip, time.time(),
+                                           self.snapshot.exit_generation)
                     # Observe safely without resetting historical baseline/stop.
                     event_code = ('PROXY_EXIT_CHANGED' if self.snapshot.observed_exit_ip is not None
                                   and self.snapshot.observed_exit_ip != browser_ip else 'ROUTE_OBSERVED')

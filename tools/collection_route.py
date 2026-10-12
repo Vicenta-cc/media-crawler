@@ -17,6 +17,8 @@ from dataclasses import dataclass, field
 from urllib.parse import quote
 
 SCHEMA_VERSION = 1
+MANAGED_ROUTE_MODES = frozenset({'proxy_required', 'proxy_preferred', 'direct_degraded'})
+ROUTE_MODES = MANAGED_ROUTE_MODES | {'legacy_direct'}
 PROXY_CONFIG_FD_ENV = "MEDIACRAWLER_PROXY_CONFIG_FD"
 MAX_ENVELOPE_BYTES = 64 * 1024
 FD_READ_TIMEOUT = 5.0
@@ -30,6 +32,10 @@ ENVELOPE_FIELDS = frozenset({
     "schema_version", "route_mode", "platform", "account_id", "profile_key",
     "proxy_id", "binding_revision", "config_revision", "endpoint", "credentials",
     "expires_at", "observed_exit", "scheduler",
+})
+MANAGED_FIELDS = frozenset({
+    'operation_id', 'lease_id', 'lease_version', 'owner_id', 'exit_generation',
+    'snapshot_digest', 'context_id',
 })
 PROVENANCE_FIELDS = frozenset({
     "schema_version", "observation_id", "source_task_id", "source_batch_id",
@@ -143,6 +149,13 @@ class BoundRoute:
     scope_ids: tuple
     route_mode: str = "proxy_required"
     schema_version: int = SCHEMA_VERSION
+    operation_id: str = field(default='', repr=False)
+    lease_id: str = field(default='', repr=False)
+    lease_version: int = field(default=0, repr=False)
+    owner_id: str = field(default='', repr=False)
+    exit_generation: int = field(default=0, repr=False)
+    snapshot_digest: str = field(default='', repr=False)
+    context_id: str = field(default='', repr=False)
 
     def __repr__(self):
         return "BoundRoute(schema_version=1, route_mode='proxy_required')"
@@ -172,6 +185,30 @@ class BoundRoute:
         elif now >= self.expires_at:
             raise CollectionRouteError("PROXY_UNAVAILABLE")
 
+    @property
+    def managed(self):
+        return bool(self.operation_id)
+
+    def require_managed_ack(self, ack=None, *, now=None):
+        """Validate the redacted App ACK before managed business traffic."""
+        if not self.managed:
+            return None
+        if not isinstance(ack, dict) or ack.get('operation_id') != self.operation_id:
+            raise CollectionRouteError('PROXY_REVISION_MISMATCH')
+        if (ack.get('lease_id') != self.lease_id or ack.get('owner_id') != self.owner_id
+                or ack.get('lease_version') != self.lease_version
+                or ack.get('snapshot_digest') != self.snapshot_digest
+                or ack.get('context_id') != self.context_id):
+            raise CollectionRouteError('PROXY_REVISION_MISMATCH')
+        expires = ack.get('expires_at')
+        if (type(expires) not in (int, float) or self.expires_at is None
+                or float(expires) != float(self.expires_at)):
+            raise CollectionRouteError('PROXY_REVISION_MISMATCH')
+        if type(ack.get('ttl')) not in (int, float) or ack['ttl'] <= 0:
+            raise CollectionRouteError('PROXY_UNAVAILABLE')
+        self.require_not_expired(now)
+        return ack
+
     def business_scope_ids(self, receipt, context_id, now=None, ttl=300):
         self.require_not_expired(now)
         require_probe_receipt(self, receipt, context_id, now=now, ttl=ttl)
@@ -182,11 +219,24 @@ RouteSnapshot = BoundRoute
 
 
 def validate_route_envelope(envelope, *, account_id, platform="dy", profile_key=None):
-    """Validate exact v1 shape and independently supplied execution identity."""
-    _exact(envelope, ENVELOPE_FIELDS)
+    """Validate legacy v1 or versioned managed route envelope.
+
+    The legacy shape remains readable for explicit compatibility, while any
+    managed route must carry operation/lease ownership and a snapshot digest.
+    """
+    if not isinstance(envelope, dict):
+        _invalid()
+    extra = set(envelope) - ENVELOPE_FIELDS
+    if extra and extra != MANAGED_FIELDS:
+        _invalid()
+    if not extra:
+        fields = ENVELOPE_FIELDS
+    else:
+        fields = ENVELOPE_FIELDS | MANAGED_FIELDS
+    _exact(envelope, fields)
     if type(envelope['schema_version']) is not int or envelope['schema_version'] != 1:
         _invalid()
-    if envelope['route_mode'] != 'proxy_required' or envelope['platform'] != platform or platform != 'dy':
+    if envelope['route_mode'] not in ROUTE_MODES or envelope['platform'] != platform or platform != 'dy':
         _invalid()
     if envelope['account_id'] != account_id:
         _invalid()
@@ -206,6 +256,22 @@ def validate_route_envelope(envelope, *, account_id, platform="dy", profile_key=
     if any(not isinstance(credentials[k], str) or len(credentials[k]) > 4096 or any(ord(c) < 32 or ord(c) == 127 for c in credentials[k]) for k in credentials):
         _invalid()
     expires_at = _timestamp(envelope['expires_at'])
+    managed = bool(extra)
+    if managed and envelope['route_mode'] == 'legacy_direct':
+        _invalid()
+    if managed:
+        for key in ('operation_id', 'lease_id', 'owner_id', 'context_id'):
+            _identity(envelope[key])
+        lease_version = _revision(envelope['lease_version'])
+        exit_generation = _revision(envelope['exit_generation'])
+        digest = envelope['snapshot_digest']
+        if not isinstance(digest, str) or not re.fullmatch(r'[0-9a-f]{64}', digest):
+            _invalid()
+        if expires_at is None or expires_at <= time.time():
+            raise CollectionRouteError('PROXY_UNAVAILABLE')
+    else:
+        lease_version = exit_generation = 0
+        digest = ''
     observed = envelope['observed_exit']
     if observed is None:
         exit_ip = exit_at = None
@@ -213,6 +279,8 @@ def validate_route_envelope(envelope, *, account_id, platform="dy", profile_key=
         _exact(observed, {'ip', 'observed_at'})
         exit_ip = canonical_exit_ip(observed['ip'])
         exit_at = _timestamp(observed['observed_at'], nullable=False)
+    if envelope['route_mode'] == 'direct_degraded' and exit_ip is None:
+        _invalid()
     scheduler = envelope['scheduler']
     _exact(scheduler, {'db_path', 'scope_ids'})
     if not isinstance(scheduler['db_path'], str) or not os.path.isabs(scheduler['db_path']) or '\x00' in scheduler['db_path']:
@@ -220,10 +288,51 @@ def validate_route_envelope(envelope, *, account_id, platform="dy", profile_key=
     scopes = derive_scope_ids(platform, account_id, proxy_id, exit_ip)
     if not isinstance(scheduler['scope_ids'], list) or scheduler['scope_ids'] != list(scopes):
         _invalid()
-    return BoundRoute(platform, account_id, derived_profile, proxy_id, binding_revision,
+    snapshot = BoundRoute(platform, account_id, derived_profile, proxy_id, binding_revision,
                       config_revision, host, endpoint['port'], credentials['username'],
                       credentials['password'], expires_at, exit_ip, exit_at,
-                      scheduler['db_path'], scopes)
+                      scheduler['db_path'], scopes, envelope['route_mode'], 1,
+                      envelope.get('operation_id', ''), envelope.get('lease_id', ''),
+                      lease_version, envelope.get('owner_id', ''), exit_generation,
+                      digest, envelope.get('context_id', ''))
+    if managed and snapshot_digest(snapshot) != digest:
+        raise CollectionRouteError('PROXY_REVISION_MISMATCH')
+    return snapshot
+
+
+def snapshot_digest(snapshot):
+    """Stable SHA-256 over non-secret route identity and lease metadata."""
+    payload = {
+        'schema_version': snapshot.schema_version, 'route_mode': snapshot.route_mode,
+        'platform': snapshot.platform, 'account_id': snapshot.account_id,
+        'profile_key': snapshot.profile_key, 'proxy_id': snapshot.proxy_id,
+        'binding_revision': snapshot.binding_revision, 'config_revision': snapshot.config_revision,
+        'host': snapshot.host, 'port': snapshot.port, 'expires_at': snapshot.expires_at,
+        'observed_exit_ip': snapshot.observed_exit_ip, 'observed_exit_at': snapshot.observed_exit_at,
+        'operation_id': snapshot.operation_id, 'lease_id': snapshot.lease_id,
+        'lease_version': snapshot.lease_version, 'owner_id': snapshot.owner_id,
+        'exit_generation': snapshot.exit_generation, 'context_id': snapshot.context_id,
+        'scope_ids': list(snapshot.scope_ids),
+    }
+    raw = json.dumps(payload, sort_keys=True, separators=(',', ':'), allow_nan=False).encode()
+    return hashlib.sha256(raw).hexdigest()
+
+
+def route_ack(snapshot, *, owner_id, lease_version, context_id=None, now=None, ttl=300):
+    """Create the redacted ACK only after owner/version/TTL checks."""
+    if not snapshot.managed or owner_id != snapshot.owner_id or lease_version != snapshot.lease_version:
+        raise CollectionRouteError('PROXY_REVISION_MISMATCH')
+    now = time.time() if now is None else float(now)
+    snapshot.require_not_expired(now)
+    if context_id is not None and context_id != snapshot.context_id:
+        raise CollectionRouteError('PROXY_REVISION_MISMATCH')
+    remaining = snapshot.expires_at - now
+    if type(ttl) not in (int, float) or not math.isfinite(ttl) or not 0 < ttl <= remaining:
+        raise CollectionRouteError('PROXY_UNAVAILABLE')
+    return {'operation_id': snapshot.operation_id, 'lease_id': snapshot.lease_id,
+            'owner_id': snapshot.owner_id, 'lease_version': snapshot.lease_version,
+            'snapshot_digest': snapshot.snapshot_digest, 'context_id': snapshot.context_id,
+            'expires_at': snapshot.expires_at, 'ttl': float(ttl)}
 
 
 def serialize_route(snapshot):
@@ -239,6 +348,11 @@ def serialize_route(snapshot):
                     credentials=dict(username=snapshot.username, password=snapshot.password),
                     expires_at=snapshot.expires_at, observed_exit=observed,
                     scheduler=dict(db_path=snapshot.scheduler_db_path, scope_ids=list(snapshot.scope_ids)))
+    if snapshot.managed:
+        envelope.update(operation_id=snapshot.operation_id, lease_id=snapshot.lease_id,
+                        lease_version=snapshot.lease_version, owner_id=snapshot.owner_id,
+                        exit_generation=snapshot.exit_generation, snapshot_digest=snapshot.snapshot_digest,
+                        context_id=snapshot.context_id)
     validate_route_envelope(envelope, account_id=snapshot.account_id, platform=snapshot.platform)
     data = json.dumps(envelope, ensure_ascii=False, allow_nan=False, separators=(',', ':')).encode('utf-8')
     if len(data) > MAX_ENVELOPE_BYTES:
@@ -321,12 +435,15 @@ class ProbeReceipt:
     context_id: str
     ip: str
     observed_at: float
+    exit_generation: int = 0
 
 
 def require_probe_receipt(snapshot, receipt, context_id, *, now=None, ttl=300):
     now = time.time() if now is None else now
     snapshot.require_not_expired(now, allow_unknown=True)
-    if not isinstance(receipt, ProbeReceipt) or receipt.proxy_id != snapshot.proxy_id or receipt.config_revision != snapshot.config_revision or receipt.context_id != context_id:
+    if (not isinstance(receipt, ProbeReceipt) or receipt.proxy_id != snapshot.proxy_id
+            or receipt.config_revision != snapshot.config_revision or receipt.context_id != context_id
+            or (snapshot.managed and receipt.exit_generation != snapshot.exit_generation)):
         raise CollectionRouteError('PROXY_REVISION_MISMATCH')
     ip = canonical_exit_ip(receipt.ip)
     at = _timestamp(receipt.observed_at, nullable=False)
@@ -373,7 +490,8 @@ class ProbeGuard:
             if self._baseline is not None and self._baseline != browser_ip:
                 raise CollectionRouteError('PROXY_EXIT_CHANGED')
             self._baseline = browser_ip
-        return ProbeReceipt(self.snapshot.proxy_id, self.snapshot.config_revision, context_id, browser_ip, at)
+        return ProbeReceipt(self.snapshot.proxy_id, self.snapshot.config_revision, context_id, browser_ip, at,
+                            self.snapshot.exit_generation)
 
     def require_business(self, receipt, context_id, *, now=None):
         self.snapshot.require_not_expired(now)

@@ -3,6 +3,7 @@ import json
 import os
 import threading
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -314,3 +315,40 @@ def test_unknown_expiry_is_probe_only_and_still_roundtrips():
     ):
         with pytest.raises(route.CollectionRouteError, match='PROXY_UNAVAILABLE'):
             business()
+
+
+def managed_snapshot():
+    base = route.validate_route_envelope(envelope(observed_exit={
+        'ip': '203.0.113.4', 'observed_at': 100.0}), account_id='acct-1')
+    snap = replace(base, route_mode='proxy_preferred', operation_id='op-1',
+                   lease_id='lease-1', lease_version=2, owner_id='app-1',
+                   exit_generation=3, context_id='ctx-1')
+    return replace(snap, snapshot_digest=route.snapshot_digest(snap))
+
+
+def test_managed_route_roundtrip_digest_and_ack_are_bound():
+    snap = managed_snapshot()
+    encoded = route.serialize_route(snap)
+    decoded = route.validate_route_envelope(json.loads(encoded), account_id='acct-1')
+    assert decoded == snap and decoded.managed
+    ack = route.route_ack(snap, owner_id='app-1', lease_version=2,
+                          context_id='ctx-1', now=100.0, ttl=30)
+    assert ack['ttl'] == 30.0
+    assert snap.require_managed_ack(ack, now=100.0) == ack
+    with pytest.raises(route.CollectionRouteError) as error:
+        snap.require_managed_ack({**ack, 'expires_at': ack['expires_at'] - 1}, now=100.0)
+    assert error.value.code == 'PROXY_REVISION_MISMATCH'
+
+
+def test_managed_route_requires_exit_generation_on_probe_receipt():
+    snap = managed_snapshot()
+    receipt = route.ProbeReceipt(snap.proxy_id, snap.config_revision, 'ctx-1',
+                                 '203.0.113.4', 100.0, exit_generation=2)
+    with pytest.raises(route.CollectionRouteError) as error:
+        route.require_probe_receipt(snap, receipt, 'ctx-1', now=100.0)
+    assert error.value.code == 'PROXY_REVISION_MISMATCH'
+
+
+def test_legacy_direct_is_explicitly_unmanaged():
+    snap = route.validate_route_envelope(envelope(route_mode='legacy_direct'), account_id='acct-1')
+    assert snap.route_mode == 'legacy_direct' and not snap.managed
