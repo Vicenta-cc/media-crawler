@@ -105,9 +105,10 @@ class SharedProbeBudget:
     def _connect(self):
         return sqlite3.connect(self.db_path, timeout=.2)
 
-    def reserve(self, category):
-        """Return pairs to perform. First context=2 pairs, later contexts=1."""
-        if category not in ('open', 'tick', 'boundary'):
+    def reserve(self, category, *, use_remaining=False):
+        """Return pairs, optionally reallocating unused total budget to login opens."""
+        if (category not in ('open', 'tick', 'boundary') or type(use_remaining) is not bool
+                or (use_remaining and category != 'open')):
             _error()
         try:
             with self._connect() as db:
@@ -116,7 +117,7 @@ class SharedProbeBudget:
                 first = category == 'open' and not initial
                 pairs = 2 if first else 1
                 counter, limit = {'open': (opens, 10), 'tick': (ticks, 24), 'boundary': (boundaries, 12)}[category]
-                if used + 2 * pairs > maximum or (not first and counter >= limit):
+                if used + 2 * pairs > maximum or (not first and counter >= limit and not use_remaining):
                     _error('PROBE_BUDGET_EXHAUSTED')
                 column = {'open': 'opens', 'tick': 'ticks', 'boundary': 'boundaries'}[category]
                 if first:
@@ -495,7 +496,7 @@ class BoundProxySession:
             self.check_stop()
             if self.context is None:
                 _error('PROXY_UNAVAILABLE')
-            pairs = self.budget.reserve(category)
+            pairs = self.budget.reserve(category, use_remaining=self._login_bootstrap and category == 'open')
             for _ in range(pairs):
                 # Shared budget is authority; per-process guard mirrors this usage.
                 self.guard.reserve_pair()

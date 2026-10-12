@@ -471,3 +471,37 @@ def test_login_bootstrap_requires_explicit_bool_and_trial_identity(tmp_path, mon
         session(tmp_path, login_bootstrap=True)
     with pytest.raises(CollectionRouteError, match='PROXY_CONFIG_INVALID'):
         session(tmp_path, trial_id='trial', login_bootstrap=1)
+
+
+def test_trial_login_reallocates_remaining_echo_budget_without_reset_or_total_increase(tmp_path):
+    path = tmp_path/'budget.sqlite'
+    budget = SharedProbeBudget(path, 'same-trial', max_calls=96)
+    with sqlite3.connect(path) as db:
+        db.execute('UPDATE collection_probe_budget SET used=30,initial=1,opens=10,boundaries=3 WHERE budget_id=?', ('same-trial',))
+    with pytest.raises(CollectionRouteError, match='PROBE_BUDGET_EXHAUSTED'):
+        budget.reserve('open')
+    assert budget.snapshot()['used'] == 30
+    assert budget.reserve('open', use_remaining=True) == 1
+    assert budget.snapshot() == {'max_calls':96,'used':32,'initial':1,'opens':11,'ticks':0,'boundaries':3}
+    with sqlite3.connect(path) as db:
+        db.execute('UPDATE collection_probe_budget SET used=95 WHERE budget_id=?', ('same-trial',))
+    with pytest.raises(CollectionRouteError, match='PROBE_BUDGET_EXHAUSTED'):
+        budget.reserve('open', use_remaining=True)
+    assert budget.snapshot()['used'] == 95
+    assert budget.snapshot()['opens'] == 11
+    for category, flag in [('tick',True), ('boundary',True), ('open',1)]:
+        with pytest.raises(CollectionRouteError, match='PROXY_CONFIG_INVALID'):
+            budget.reserve(category, use_remaining=flag)
+
+
+@pytest.mark.asyncio
+async def test_only_explicit_trial_login_session_reallocates_open_budget(tmp_path):
+    value, context, _ = session(tmp_path, trial_id='trial-login', login_bootstrap=True)
+    with sqlite3.connect(value.snapshot.scheduler_db_path) as db:
+        db.execute('UPDATE collection_probe_budget SET used=30,initial=1,opens=10,boundaries=3 WHERE budget_id=?', (value.budget.budget_id,))
+    try:
+        await value.open_context(context)
+        assert value.budget.snapshot()['used'] == 32
+        assert value.budget.snapshot()['opens'] == 11
+    finally:
+        await value.close()
