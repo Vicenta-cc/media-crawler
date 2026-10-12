@@ -1,6 +1,7 @@
 """Fixed collection route, isolated exit probes and shared finite echo budget."""
 import asyncio
 import fcntl
+import hashlib
 import stat
 import threading
 import json
@@ -320,7 +321,7 @@ class BoundProxySession:
         self.snapshot.require_not_expired(allow_unknown=True)
         try:
             with self.budget._connect() as db:
-                row = db.execute('SELECT stop_code FROM collection_route_health WHERE proxy_id=? AND config_revision=?', (self.snapshot.proxy_id, self.snapshot.config_revision)).fetchone()
+                row = db.execute('SELECT stop_code FROM collection_route_health WHERE proxy_id=? AND config_revision=?', (self._health_key(), self.snapshot.config_revision)).fetchone()
             if row and not self.maintenance_only:
                 _error(row[0])
         except sqlite3.Error:
@@ -345,16 +346,23 @@ class BoundProxySession:
             except (OSError,ValueError,KeyError):
                 pass
 
+    def _health_key(self):
+        if self.snapshot.route_mode=='direct_degraded':
+            return 'service-direct.'+hashlib.sha256(self.snapshot.observed_exit_ip.encode()).hexdigest()[:32]+'.'+str(self.snapshot.exit_generation)
+        return self.snapshot.proxy_id
+
     def fail(self, code):
         error = CollectionRouteError(code)
         self._stopped = error.code
-        try:
-            with self.budget._connect() as db:
-                db.execute('INSERT OR REPLACE INTO collection_route_health VALUES(?,?,?)',
-                           (self.snapshot.proxy_id, self.snapshot.config_revision, error.code))
-        except sqlite3.Error:
-            pass  # Local sticky stop still applies; public failure is unchanged.
-        self._event(error.code)
+        transport=error.code in {'PROXY_AUTH_FAILED','PROXY_CONNECTION_REFUSED','PROXY_TRANSPORT_FAILED','PROXY_EXPIRED','PROXY_EXIT_CHANGED'}
+        if transport or not self.snapshot.managed:
+            try:
+                with self.budget._connect() as db:
+                    db.execute('INSERT OR REPLACE INTO collection_route_health VALUES(?,?,?)',
+                               (self._health_key(), self.snapshot.config_revision, error.code))
+            except sqlite3.Error:
+                pass
+            self._event(error.code)
         return error
 
     async def open_context(self, context, context_id=None, on_probe_page=None):
@@ -436,7 +444,8 @@ class BoundProxySession:
         task.add_done_callback(self._counter_tasks.discard)
 
     def _stop_background(self):
-        self.fail('PROXY_UNAVAILABLE')
+        # Admission, pacing and counter stops are local safety decisions.
+        self._stopped='PROXY_UNAVAILABLE'
         if self.context is not None:
             self._spawn_counter(self._close_for_stop())
 
@@ -510,6 +519,10 @@ class BoundProxySession:
                 if (not row or row[0] != self.snapshot.exit_generation or (row[3] and not recovery)
                         or not 0 <= now-row[1] <= 300 or (row[2] is not None and row[2] > now and not (recovery and account[1]=='manual_claimed'))
                         or not admission or tuple(admission) != (self.snapshot.account_id,key,self.snapshot.exit_generation,'active')):
+                    _error('PROXY_UNAVAILABLE')
+            for scope in self.snapshot.scope_ids:
+                cooldown=db.execute('SELECT cooldown_until FROM request_scheduler_state WHERE platform=?',(scope,)).fetchone()
+                if cooldown and cooldown[0]>now:
                     _error('PROXY_UNAVAILABLE')
             for previous, pid in db.execute('SELECT token,pid FROM collection_browser_requests WHERE active=1').fetchall():
                 if not RequestScheduler._alive(pid):
