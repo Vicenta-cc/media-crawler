@@ -164,11 +164,17 @@ class BoundProxySession:
     def __init__(self, snapshot, *, echo_url=None, budget_id=None, stop_checker=None,
                  ttl=None, max_calls=None, verify=True, http_client_factory=None,
                  policy=None, maintenance_only=False, trial_id=None, reuse_existing_policy=False,
-                 account_policy=None):
+                 account_policy=None, login_bootstrap=False):
         self.snapshot = snapshot
         if trial_id is not None and not isinstance(trial_id, str):
             _error()
         self._trial_id = trial_id
+        if type(login_bootstrap) is not bool:
+            _error()
+        effective_trial_id = trial_id if trial_id is not None else os.getenv('MEDIACRAWLER_PROXY_TRIAL_ID', '')
+        if login_bootstrap and not effective_trial_id:
+            _error()
+        self._login_bootstrap = login_bootstrap
         if type(maintenance_only) is not bool:
             _error()
         self.maintenance_only = maintenance_only
@@ -339,7 +345,8 @@ class BoundProxySession:
             state['requests'] += 1
             state['times'] = [stamp for stamp in state['times'] if stamp > now - 60]
             state['times'].append(now)
-            if state['requests'] > 300 or len(state['times']) > 120 or now - state['opened'] > 1200:
+            rolling_limit = 300 if self._login_bootstrap and now - state['opened'] < 60 else 120
+            if state['requests'] > 300 or len(state['times']) > rolling_limit or now - state['opened'] > 1200:
                 self._stop_background()
 
         async def request_finished(request):
@@ -462,7 +469,10 @@ class BoundProxySession:
         try:
             async with self._http_client_factory(proxy=self.snapshot.httpx_proxy(), trust_env=False,
                                                  verify=self.verify, follow_redirects=False, timeout=10) as client:
-                response = await client.get(self.echo_url, headers={'Accept': 'application/json,text/plain'})
+                response = await client.get(self.echo_url, headers={
+                    'Accept': 'application/json,text/plain',
+                    'User-Agent': 'ZhanyunProxyProbe/1.0',
+                })
             if response.status_code != 200:
                 _error('PROXY_AUTH_FAILED' if response.status_code == 407 else 'PROXY_UNAVAILABLE')
             return parse_exit_sample(response.content)

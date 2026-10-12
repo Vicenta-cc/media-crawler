@@ -393,3 +393,81 @@ async def test_missing_account_supplement_without_fallback_fails_closed(tmp_path
     with sqlite3.connect(tmp_path/'gate.sqlite') as db:
         assert db.execute("SELECT 1 FROM request_scheduler_policy WHERE platform='dy:account:account1'").fetchone() is None
     await value.close()
+
+
+@pytest.mark.asyncio
+async def test_http_echo_custom_user_agent_without_platform_credentials(tmp_path, monkeypatch):
+    value, _, _ = session(tmp_path)
+    requests = []
+    options = []
+    monkeypatch.setenv('HTTP_PROXY', 'http://trap.invalid:8080')
+    monkeypatch.setenv('NO_PROXY', '*')
+
+    def factory(**kwargs):
+        options.append(kwargs)
+        def respond(request):
+            requests.append(request)
+            return httpx.Response(200, text='203.0.113.1')
+        return httpx.AsyncClient(transport=httpx.MockTransport(respond), trust_env=False)
+
+    value._http_client_factory = factory
+    try:
+        assert await value._http_sample() == '203.0.113.1'
+        assert len(requests) == 1
+        request = requests[0]
+        assert str(request.url) == value.echo_url
+        assert request.headers['User-Agent'] == 'ZhanyunProxyProbe/1.0'
+        assert request.headers['Accept'] == 'application/json,text/plain'
+        assert all(header not in request.headers for header in (
+            'Cookie', 'Authorization', 'Proxy-Authorization'))
+        assert options[0]['proxy'] == value.snapshot.httpx_proxy()
+        assert options[0]['trust_env'] is False
+        assert options[0]['follow_redirects'] is False
+        assert options[0]['verify'] is True
+    finally:
+        await value.close()
+
+
+@pytest.mark.asyncio
+async def test_trial_login_bootstrap_first_minute_keeps_total_cap_then_normal_rolling(tmp_path, monkeypatch):
+    monkeypatch.delenv('MEDIACRAWLER_PROXY_TRIAL_ID', raising=False)
+    value, _, _ = session(tmp_path, trial_id='trial-login', login_bootstrap=True)
+    callbacks = {}
+    class CounterPage:
+        def on(self, event, callback):
+            callbacks[event] = callback
+        def is_closed(self):
+            return False
+    page = CounterPage()
+    try:
+        value._monitor_page(page)
+        for _ in range(121):
+            callbacks['request'](object())
+        assert value._stopped is None
+        for _ in range(179):
+            callbacks['request'](object())
+        assert value._stopped is None
+        callbacks['request'](object())
+        assert value._stopped == 'PROXY_UNAVAILABLE'
+    finally:
+        await value.close()
+
+    later, _, _ = session(tmp_path, trial_id='trial-later', login_bootstrap=True)
+    callbacks.clear()
+    page = CounterPage()
+    try:
+        later._monitor_page(page)
+        later._page_counts[id(page)]['opened'] -= 61
+        for _ in range(121):
+            callbacks['request'](object())
+        assert later._stopped == 'PROXY_UNAVAILABLE'
+    finally:
+        await later.close()
+
+
+def test_login_bootstrap_requires_explicit_bool_and_trial_identity(tmp_path, monkeypatch):
+    monkeypatch.delenv('MEDIACRAWLER_PROXY_TRIAL_ID', raising=False)
+    with pytest.raises(CollectionRouteError, match='PROXY_CONFIG_INVALID'):
+        session(tmp_path, login_bootstrap=True)
+    with pytest.raises(CollectionRouteError, match='PROXY_CONFIG_INVALID'):
+        session(tmp_path, trial_id='trial', login_bootstrap=1)
