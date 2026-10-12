@@ -145,3 +145,17 @@ async def test_actual_browser_restart_and_account_storage_isolation(tmp_path, he
             assert not any(c["name"] == "fixture" for c in await other.cookies())
         finally:
             await other.close()
+
+
+@pytest.mark.asyncio
+async def test_failed_context_cleanup_retains_profile_lock(monkeypatch,tmp_path):
+    import cloakbrowser
+    original_close=AsyncMock(side_effect=RuntimeError('fixture cleanup failure'))
+    monkeypatch.setattr(cloakbrowser,'launch_persistent_context_async',AsyncMock(return_value=SimpleNamespace(close=original_close)))
+    context,_=await launch_account_context('retained',tmp_path,headless=True)
+    with pytest.raises(RuntimeError,match='cleanup failure'):await context.close()
+    with pytest.raises(RuntimeError,match='already in use'):await launch_account_context('retained',tmp_path,headless=True)
+    original_close.side_effect=None
+    await context.close()
+    replacement,_=await launch_account_context('retained',tmp_path,headless=True)
+    await replacement.close()

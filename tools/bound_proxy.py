@@ -2,6 +2,7 @@
 import asyncio
 import fcntl
 import stat
+import threading
 import json
 import math
 import os
@@ -20,6 +21,22 @@ from tools.collection_route import (
 
 def _error(code='PROXY_CONFIG_INVALID'):
     raise CollectionRouteError(code)
+
+
+def transport_error_code(error, *, managed=False):
+    if isinstance(error, httpx.ProxyError) and '407' in str(error):
+        return 'PROXY_AUTH_FAILED'
+    if managed and isinstance(error, httpx.ConnectError):
+        import errno
+        cause = error
+        for _ in range(8):
+            if getattr(cause, 'errno', None) == errno.ECONNREFUSED:
+                return 'PROXY_CONNECTION_REFUSED'
+            cause = getattr(cause, '__cause__', None) or getattr(cause, '__context__', None)
+            if cause is None:
+                break
+        return 'PROXY_TRANSPORT_FAILED'
+    return 'PROXY_UNAVAILABLE'
 
 
 def fixed_echo_url(value):
@@ -51,6 +68,21 @@ def parse_exit_sample(body):
         return canonical_exit_ip(sample)
     except (ValueError, UnicodeError, TypeError, CollectionRouteError):
         raise CollectionRouteError('PROXY_UNAVAILABLE') from None
+
+
+def emit_account_risk(snapshot):
+    if not snapshot.managed:
+        return False
+    try:
+        fd = int(os.environ['MEDIACRAWLER_PROXY_RECEIPT_FD'])
+        value = dict(type='account_risk',operation_id=snapshot.operation_id,owner_id=snapshot.owner_id,
+            lease_version=snapshot.lease_version,snapshot_digest=snapshot.snapshot_digest,context_id=snapshot.context_id,
+            reason='ACCOUNT_CHALLENGE')
+        data = (json.dumps(value,allow_nan=False)+'\n').encode()
+        os.set_blocking(fd,False)
+        return os.write(fd,data)==len(data)
+    except (OSError,ValueError,KeyError):
+        return False
 
 
 def emit_probe_receipt(snapshot, receipt, *, closed=False, env=None):
@@ -165,24 +197,66 @@ def initialize_bound_route(env=None, *, platform='dy'):
     return _process_route
 
 
+def obtain_route_ack(snapshot, *, env=None, timeout=5.0, previous_ack=None):
+    """Request App authorization on inherited pipes before any network I/O."""
+    if not snapshot.managed:
+        return None
+    env = os.environ if env is None else env
+    try:
+        read_fd = int(env['MEDIACRAWLER_ROUTE_ACK_FD'])
+        write_fd = int(env['MEDIACRAWLER_PROXY_RECEIPT_FD'])
+        if (min(read_fd, write_fd) < 3 or type(timeout) not in (int,float) or not math.isfinite(timeout) or not 0 < timeout <= 5
+                or fcntl.fcntl(read_fd,fcntl.F_GETFL) & os.O_ACCMODE != os.O_RDONLY
+                or fcntl.fcntl(write_fd,fcntl.F_GETFL) & os.O_ACCMODE != os.O_WRONLY
+                or not stat.S_ISFIFO(os.fstat(read_fd).st_mode) or not stat.S_ISFIFO(os.fstat(write_fd).st_mode)):
+            _error()
+        request = dict(type='route_ack', operation_id=snapshot.operation_id, owner_id=snapshot.owner_id,
+            lease_version=snapshot.lease_version, snapshot_digest=snapshot.snapshot_digest,
+            context_id=snapshot.context_id)
+        if previous_ack is not None:
+            request = dict(type='route_renew', operation_id=uuid4().hex, route_operation_id=snapshot.operation_id, owner_id=snapshot.owner_id, lease_version=previous_ack['lease_version'])
+        os.write(write_fd, (json.dumps(request, allow_nan=False) + '\n').encode())
+        import select
+        deadline = time.monotonic()+timeout
+        raw = bytearray()
+        while len(raw) < 4096:
+            remaining=deadline-time.monotonic()
+            if remaining <= 0 or not select.select([read_fd], [], [], remaining)[0]:
+                _error('PROXY_UNAVAILABLE')
+            chunk = os.read(read_fd, 1)
+            if chunk == b'\n':
+                return snapshot.require_managed_ack(json.loads(raw), lease_version=snapshot.lease_version if previous_ack is None else previous_ack['lease_version']+1)
+            if not chunk:
+                break
+            raw.extend(chunk)
+        _error()
+    except (KeyError, ValueError, OSError, TypeError):
+        _error('PROXY_REVISION_MISMATCH')
+
+
 class BoundProxySession:
     """A frozen route with one live browser context and a validated receipt."""
     def __init__(self, snapshot, *, echo_url=None, budget_id=None, stop_checker=None,
                  ttl=None, max_calls=None, verify=True, http_client_factory=None,
                  policy=None, maintenance_only=False, trial_id=None, reuse_existing_policy=False,
-                 account_policy=None, login_bootstrap=False, ack=None):
+                 account_policy=None, login_bootstrap=False, ack=None, lease_renewer=None):
         self.snapshot = snapshot
         # Managed routes are unusable until the App's redacted ACK has been
         # validated.  This fail-closed check also prevents callers from
         # falling through to an unmanaged automatic proxy pool.
-        self.snapshot.require_managed_ack(ack)
+        if ack is not None and (not isinstance(ack,dict) or type(ack.get('lease_version')) is not int or ack['lease_version'] < snapshot.lease_version):
+            _error('PROXY_REVISION_MISMATCH')
+        self._lease_ack = self.snapshot.require_managed_ack(ack, lease_version=ack.get('lease_version')) if ack is not None else obtain_route_ack(snapshot)
+        self._lease_renewer = lease_renewer
+        self._lease_lock = threading.RLock()
         if trial_id is not None and not isinstance(trial_id, str):
             _error()
         self._trial_id = trial_id
         if type(login_bootstrap) is not bool:
             _error()
         effective_trial_id = trial_id if trial_id is not None else os.getenv('MEDIACRAWLER_PROXY_TRIAL_ID', '')
-        if login_bootstrap and not effective_trial_id:
+        login_bootstrap = login_bootstrap or snapshot.login_bootstrap
+        if login_bootstrap and not effective_trial_id and not (snapshot.managed and snapshot.login_bootstrap):
             _error()
         self._login_bootstrap = login_bootstrap
         if type(maintenance_only) is not bool:
@@ -220,11 +294,25 @@ class BoundProxySession:
         self._gate = None
         self._counter_tasks = set()
         self._page_counts = {}
+        self._browser_tokens = {}
+        self._browser_opened_at = time.time()
+        with self.budget._connect() as db:
+            db.execute('CREATE TABLE IF NOT EXISTS collection_browser_requests (token TEXT PRIMARY KEY,exit_key TEXT NOT NULL,pid INTEGER NOT NULL,started_at REAL NOT NULL,active INTEGER NOT NULL)')
         self._echo_context_handler = None
         self._receipt_delivered = False
         self.trial_limits = None
 
     def check_stop(self):
+        if self.snapshot.managed:
+            with self._lease_lock:
+                if self._lease_ack['expires_at'] <= time.time() and not self._lease_renewer:
+                    _error('PROXY_UNAVAILABLE')
+                if self._lease_ack['expires_at'] - time.time() < 30:
+                    previous = self._lease_ack
+                    renewed = self._lease_renewer(previous) if self._lease_renewer else obtain_route_ack(self.snapshot, previous_ack=previous)
+                    if type(renewed.get('lease_version')) is not int or renewed['lease_version'] <= previous['lease_version']:
+                        _error('PROXY_REVISION_MISMATCH')
+                    self._lease_ack = self.snapshot.require_managed_ack(renewed, lease_version=renewed['lease_version'])
         if self._stopped:
             _error(self._stopped)
         self.snapshot.require_not_expired(allow_unknown=True)
@@ -263,7 +351,7 @@ class BoundProxySession:
         self.check_stop()
         if self.context is not None:
             _error()
-        self.context, self.context_id = context, context_id or uuid4().hex
+        self.context, self.context_id = context, self.snapshot.context_id if self.snapshot.managed else context_id or uuid4().hex
         self._on_probe_page = on_probe_page
         if callable(getattr(context, 'route', None)):
             # Chromium's implicit favicon request is context-level; page.route
@@ -278,6 +366,15 @@ class BoundProxySession:
                 except Exception:
                     is_probe = False
                 if not is_probe and not request.url.startswith(echo_origin + '/'):
+                    if self.snapshot.managed:
+                        try:
+                            self.check_stop()
+                            token = self._reserve_browser_request()
+                            self._browser_tokens[id(request)] = token
+                        except (CollectionRouteError, RuntimeError, sqlite3.Error):
+                            await route.abort()
+                            self._stop_background()
+                            return
                     # Preserve later business CDP/page guards and route handlers.
                     await route.fallback()
                     return
@@ -378,13 +475,56 @@ class BoundProxySession:
 
         if callable(getattr(page, 'on', None)):
             page.on('request', request_started)
-            page.on('requestfinished', lambda request: self._spawn_counter(request_finished(request)))
+            page.on('requestfinished', lambda request: (self._release_browser_request(request), self._spawn_counter(request_finished(request))))
+            page.on('requestfailed', self._release_browser_request)
             self._spawn_counter(lifetime())
+
+    def _reserve_browser_request(self):
+        """Fence automatic browser traffic and bound shared-exit concurrency."""
+        from tools.persistent_request_gate import RequestScheduler
+        now = time.time()
+        fence = self._safety_fence()
+        key = self.snapshot.observed_exit_ip
+        token = uuid4().hex
+        with self.budget._connect() as db:
+            if fence:
+                db.execute('ATTACH DATABASE ? AS safety', (fence['db_path'],))
+            db.execute('BEGIN IMMEDIATE')
+            if fence:
+                row = db.execute('SELECT generation,observed_at,paused_until,pause_reason FROM safety.crawler_shared_exits WHERE exit_key=?', (key,)).fetchone()
+                admission = db.execute('SELECT account_id,exit_key,generation,state FROM safety.crawler_route_admissions WHERE operation_id=?', (self.snapshot.operation_id,)).fetchone()
+                account = db.execute('SELECT recovery_claim,recovery_state FROM safety.crawler_accounts WHERE id=?',(self.snapshot.account_id,)).fetchone()
+                recovery = bool(account and self.snapshot.recovery_claim and account[0] == self.snapshot.recovery_claim and account[1] == 'claimed')
+                if (not row or row[0] != self.snapshot.exit_generation or (row[3] and not recovery)
+                        or not 0 <= now-row[1] <= 300 or (row[2] is not None and row[2] > now)
+                        or not admission or tuple(admission) != (self.snapshot.account_id,key,self.snapshot.exit_generation,'active')):
+                    _error('PROXY_UNAVAILABLE')
+            for previous, pid in db.execute('SELECT token,pid FROM collection_browser_requests WHERE active=1').fetchall():
+                if not RequestScheduler._alive(pid):
+                    db.execute('UPDATE collection_browser_requests SET active=0 WHERE token=?',(previous,))
+            db.execute('DELETE FROM collection_browser_requests WHERE active=0 AND started_at<?',(now-60,))
+            count, active = db.execute('SELECT COUNT(*),COALESCE(SUM(active),0) FROM collection_browser_requests WHERE exit_key=? AND (started_at>? OR active=1)',(key,now-60)).fetchone()
+            rolling, concurrent = (40,16) if self.snapshot.route_mode == 'direct_degraded' else (120,32)
+            if self._login_bootstrap and now-self._browser_opened_at < 60:
+                rolling, concurrent = 300,32
+            if count >= rolling or active >= concurrent:
+                _error('PROBE_BUDGET_EXHAUSTED')
+            db.execute('INSERT INTO collection_browser_requests VALUES(?,?,?,?,1)',(token,key,os.getpid(),now))
+        return token
+
+    def _release_browser_request(self, request):
+        token = self._browser_tokens.pop(id(request),None)
+        if token:
+            with self.budget._connect() as db:
+                db.execute('UPDATE collection_browser_requests SET active=0 WHERE token=?',(token,))
 
     async def _periodic_probe(self):
         try:
             while True:
-                await asyncio.sleep(self.guard.ttl)
+                pause = self.guard.ttl
+                if self.snapshot.managed:
+                    pause = min(pause,max(1,self._lease_ack['expires_at']-time.time()-25))
+                await asyncio.sleep(pause)
                 await self._probe('tick')
         except asyncio.CancelledError:
             raise
@@ -488,8 +628,8 @@ class BoundProxySession:
             return parse_exit_sample(response.content)
         except CollectionRouteError:
             raise
-        except httpx.ProxyError as exc:
-            raise CollectionRouteError('PROXY_AUTH_FAILED' if '407' in str(exc) else 'PROXY_UNAVAILABLE') from None
+        except httpx.HTTPError as exc:
+            raise CollectionRouteError(transport_error_code(exc, managed=self.snapshot.managed)) from None
         except Exception:
             raise CollectionRouteError('PROXY_UNAVAILABLE') from None
 
@@ -519,7 +659,7 @@ class BoundProxySession:
                         try:
                             await self._http_sample()
                         except CollectionRouteError as http_error:
-                            if http_error.code == 'PROXY_AUTH_FAILED':
+                            if http_error.code in {'PROXY_AUTH_FAILED', 'PROXY_CONNECTION_REFUSED', 'PROXY_TRANSPORT_FAILED'}:
                                 raise http_error from None
                     raise browser_error from None
                 http_ip = await self._http_sample()
@@ -551,6 +691,13 @@ class BoundProxySession:
                     except RuntimeError:
                         _error('PROBE_BUDGET_EXHAUSTED')
             return self.receipt
+
+    def _safety_fence(self):
+        if not self.snapshot.safety_db_path:
+            return None
+        return dict(db_path=self.snapshot.safety_db_path, exit_ip=self.snapshot.observed_exit_ip,
+            account_id=self.snapshot.account_id, generation=self.snapshot.exit_generation,
+            operation_id=self.snapshot.operation_id, ttl=300, recovery_claim=self.snapshot.recovery_claim)
 
     def _make_gate(self):
         from tools.persistent_request_gate import RequestScheduler, MultiScopeGate, configured_gate
@@ -587,7 +734,7 @@ class BoundProxySession:
                         min_interval=limits[0], per_minute=limits[1], max_concurrency=limits[2],
                         media_interval=limits[3], replace_policy=False)
                 return MultiScopeGate(self.snapshot.scheduler_db_path, scopes,
-                                      stop_checker=self.check_stop)
+                                      stop_checker=self.check_stop, safety_fence=self._safety_fence())
             except (ValueError, sqlite3.Error, TypeError, OverflowError):
                 raise CollectionRouteError('SCHEDULER_POLICY_CONFLICT') from None
         if self._policy is None:
@@ -610,6 +757,9 @@ class BoundProxySession:
             policy = dict(self._policy)
             account_policy = policy
         scopes = self.guard.require_business(self.receipt, self.context_id)
+        if self.snapshot.route_mode == 'direct_degraded':
+            policy = {**policy, 'min_interval': max(9.0, policy['min_interval']), 'per_minute': min(6, policy['per_minute'])}
+            account_policy = {**account_policy, 'min_interval': max(9.0, account_policy['min_interval']), 'per_minute': min(6, account_policy['per_minute'])}
         try:
             for scope in scopes:
                 RequestScheduler(self.snapshot.scheduler_db_path, platform=scope,
@@ -618,7 +768,7 @@ class BoundProxySession:
         except (ValueError, sqlite3.Error):
             raise CollectionRouteError('SCHEDULER_POLICY_CONFLICT') from None
         return MultiScopeGate(self.snapshot.scheduler_db_path, scopes, stop_checker=self.check_stop,
-                              cooldown_seconds=policy['cooldown_seconds'])
+                              cooldown_seconds=policy['cooldown_seconds'], safety_fence=self._safety_fence())
 
     async def ensure_business(self):
         if self.maintenance_only:

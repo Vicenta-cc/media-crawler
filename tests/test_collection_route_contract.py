@@ -336,7 +336,7 @@ def test_managed_route_roundtrip_digest_and_ack_are_bound():
     assert ack['ttl'] == 30.0
     assert snap.require_managed_ack(ack, now=100.0) == ack
     with pytest.raises(route.CollectionRouteError) as error:
-        snap.require_managed_ack({**ack, 'expires_at': ack['expires_at'] - 1}, now=100.0)
+        snap.require_managed_ack({**ack, 'expires_at': ack['expires_at'] + 1}, now=100.0)
     assert error.value.code == 'PROXY_REVISION_MISMATCH'
 
 

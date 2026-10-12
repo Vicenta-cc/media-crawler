@@ -8,6 +8,8 @@ import os
 import sqlite3
 from pathlib import Path
 
+_failed_profile_locks = {}
+
 
 def profile_for(account_id: str, root: Path, version: str) -> dict:
     if not account_id.strip():
@@ -64,7 +66,7 @@ async def launch_account_context(account_id: str, root: Path, *, headless: bool,
     try:
         context = await launch_persistent_context_async(
             user_data_dir=profile["directory"], headless=headless, proxy=proxy,
-            args=[f"--fingerprint={profile['seed']}", *(browser_args or [])],
+            args=[f"--fingerprint={profile['seed']}", *(["--no-proxy-server"] if route_snapshot is not None and route_snapshot.route_mode in {"direct_degraded", "legacy_direct"} else []), *(browser_args or [])],
             browser_version=profile["version"], humanize=False, geoip=False,
             accept_downloads=True,
         )
@@ -82,7 +84,12 @@ async def launch_account_context(account_id: str, root: Path, *, headless: bool,
             if bound_proxy_session is not None:
                 await bound_proxy_session.close()
             await close(*args, **kwargs)
-        finally:
+        except BaseException:
+            # Keep the Profile fence when browser cleanup cannot be proven.
+            _failed_profile_locks[str(profile['directory'])] = lock
+            raise
+        else:
+            _failed_profile_locks.pop(str(profile['directory']), None)
             lock.close()
 
     context.close = close_locked

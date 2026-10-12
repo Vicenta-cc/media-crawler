@@ -262,7 +262,8 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
                             response = await client.request(method, url, timeout=timeout, follow_redirects=False, **kwargs)
                     except httpx.HTTPError as exc:
                         if bound is not None:
-                            raise bound.fail('PROXY_AUTH_FAILED' if isinstance(exc, httpx.ProxyError) and '407' in str(exc) else 'PROXY_UNAVAILABLE') from None
+                            from tools.bound_proxy import transport_error_code
+                            raise bound.fail(transport_error_code(exc, managed=bound.snapshot.managed)) from None
                         raise
                     if bound is not None and response.status_code == 407:
                         raise bound.fail('PROXY_AUTH_FAILED')
@@ -303,6 +304,10 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
             payload = None
 
         if self._requires_verification(response, payload):
+            if self._bound_proxy_session is not None:
+                from tools.bound_proxy import emit_account_risk
+                emit_account_risk(self._bound_proxy_session.snapshot)
+                self._bound_proxy_session._stopped = 'PROXY_UNAVAILABLE'
             utils.logger.error("ACCOUNT_VERIFY: platform request requires verification")
             raise DataFetchError("ACCOUNT_VERIFY")
         if response.status_code >= 400:

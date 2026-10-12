@@ -96,8 +96,11 @@ def test_crashed_process_releases_capacity_not_history(tmp_path):
 
 def test_expired_lease_and_changed_policy_preserve_budget(tmp_path):
     now=[100.0];state=RequestScheduler(tmp_path/'gate.sqlite3',min_interval=0,per_minute=1000,clock=lambda:now[0])
-    state.try_acquire(lease_seconds=2)
+    _,token,_=state.try_acquire(lease_seconds=2)
     now[0]=103
+    assert state.try_acquire(lease_seconds=2)[0]>0
+    assert state.snapshot()['in_flight']==1
+    state.release(token)
     assert state.try_acquire(lease_seconds=2)[0]==0
     state.update_policy(min_interval=0,per_minute=1,max_concurrency=1,media_interval=5)
     assert state.try_acquire()[0]==60

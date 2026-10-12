@@ -220,7 +220,7 @@ def _scope_ids(scope_ids):
     return sorted(set(values))
 
 
-def _try_reserve_scopes(db_path, scope_ids, operation, lease_seconds, now, jitter_options=None):
+def _try_reserve_scopes(db_path, scope_ids, operation, lease_seconds, now, jitter_options=None, safety_fence=None):
     scopes = _scope_ids(scope_ids)
     now = float(now)
     if not math.isfinite(now) or (lease_seconds is not None and
@@ -229,7 +229,19 @@ def _try_reserve_scopes(db_path, scope_ids, operation, lease_seconds, now, jitte
     pending = []
     target, reason = now, 'ready'
     with sqlite3.connect(db_path, timeout=.2) as c:
+        if safety_fence:
+            c.execute('ATTACH DATABASE ? AS safety', (safety_fence['db_path'],))
         c.execute('BEGIN IMMEDIATE')
+        if safety_fence:
+            row = c.execute('SELECT generation,observed_at,paused_until,pause_reason FROM safety.crawler_shared_exits WHERE exit_key=?', (safety_fence['exit_ip'],)).fetchone()
+            admission = c.execute('SELECT account_id,exit_key,generation,state FROM safety.crawler_route_admissions WHERE operation_id=?', (safety_fence['operation_id'],)).fetchone()
+            account = c.execute('SELECT recovery_claim,recovery_state FROM safety.crawler_accounts WHERE id=?', (safety_fence['account_id'],)).fetchone()
+            recovery = bool(account and safety_fence.get('recovery_claim') and account[0] == safety_fence['recovery_claim'] and account[1] == 'claimed')
+            if (not row or row[0] != safety_fence['generation'] or (row[3] and not recovery)
+                    or not 0 <= now - row[1] <= safety_fence['ttl']
+                    or (row[2] is not None and row[2] > now)
+                    or not admission or tuple(admission) != (safety_fence['account_id'], safety_fence['exit_ip'], safety_fence['generation'], 'active')):
+                raise RuntimeError('ACCOUNT_CHALLENGE')
         for scope in scopes:
             policy_row = c.execute('SELECT limits_json FROM request_scheduler_policy WHERE platform=?', (scope,)).fetchone()
             try:
@@ -258,10 +270,12 @@ def _try_reserve_scopes(db_path, scope_ids, operation, lease_seconds, now, jitte
                     scope_target, scope_reason = max(channel[0], channel[1] + media_interval), 'media_interval'
             active = []
             for token, pid, expires in c.execute('SELECT token,pid,expires_at FROM request_scheduler_leases WHERE platform=?', (scope,)).fetchall():
-                if expires <= now or not RequestScheduler._alive(pid):
+                if not RequestScheduler._alive(pid):
                     c.execute('DELETE FROM request_scheduler_leases WHERE token=?', (token,))
                 else:
-                    active.append(expires)
+                    # A live operation may hold a body/browser beyond its deadline;
+                    # only explicit completion or process death releases capacity.
+                    active.append(max(expires, now + .1))
             if lease_seconds is not None and len(active) >= concurrency:
                 capacity_target = now + min(.1, max(0., min(active) - now))
                 if capacity_target > scope_target:
@@ -286,7 +300,7 @@ def _try_reserve_scopes(db_path, scope_ids, operation, lease_seconds, now, jitte
         return dict(delay=0., reason='ready', scope_tokens=tokens)
 
 
-def try_reserve_scopes(db_path, scope_ids, operation='api', lease_seconds=None, now=None):
+def try_reserve_scopes(db_path, scope_ids, operation='api', lease_seconds=None, now=None, safety_fence=None):
     """Reserve every registered scope in one transaction, or debit none.
 
     Business route wrappers must enforce their four required scopes; this generic
@@ -294,7 +308,7 @@ def try_reserve_scopes(db_path, scope_ids, operation='api', lease_seconds=None, 
     """
     try:
         return _try_reserve_scopes(db_path, scope_ids, operation, lease_seconds,
-                                   time.time() if now is None else now)
+                                   time.time() if now is None else now, safety_fence=safety_fence)
     except sqlite3.OperationalError as exc:
         if 'no such table' in str(exc).lower():
             raise RuntimeError('SCHEDULER_POLICY_CONFLICT') from None
@@ -330,9 +344,9 @@ def _check_stop(stop_checker):
         raise RuntimeError('REQUEST_SCHEDULER_STOPPED')
 
 
-def _reservation(db_path, scope_ids, operation, lease_seconds):
+def _reservation(db_path, scope_ids, operation, lease_seconds, safety_fence=None):
     try:
-        return try_reserve_scopes(db_path, scope_ids, operation, lease_seconds)
+        return try_reserve_scopes(db_path, scope_ids, operation, lease_seconds, safety_fence=safety_fence)
     except sqlite3.OperationalError as exc:
         if 'locked' not in str(exc).lower():
             raise
@@ -370,9 +384,10 @@ def slot_scopes(db_path, scope_ids, operation='api', *, timeout=60, max_wait=300
 
 class MultiScopeGate:
     """Async adapter over pre-registered policies, compatible with gate callers."""
-    def __init__(self, db_path, scope_ids, *, stop_checker=None, cooldown_seconds=300):
+    def __init__(self, db_path, scope_ids, *, stop_checker=None, cooldown_seconds=300, safety_fence=None):
         self.db_path = db_path
         self.scope_ids = _scope_ids(scope_ids)
+        self.safety_fence = safety_fence
         self.stop_checker = stop_checker
         self.cooldown_seconds = cooldown_seconds
         self.state = self
@@ -382,7 +397,7 @@ class MultiScopeGate:
         start = time.monotonic()
         while True:
             _check_stop(self.stop_checker)
-            result = _reservation(self.db_path, self.scope_ids, operation, lease_seconds)
+            result = _reservation(self.db_path, self.scope_ids, operation, lease_seconds, self.safety_fence)
             if result['delay'] == 0:
                 return result['scope_tokens'], time.monotonic() - start
             if time.monotonic() - start + result['delay'] > max_wait:
@@ -427,4 +442,4 @@ def _scope_snapshot(db_path, scope, now):
     return dict(platform=scope, next_allowed_at=row[0] if row else 0,
                 cooldown_until=row[1] if row else 0, last_reason=row[3] if row else '',
                 request_count_last_minute=sum(x > now - 60 for x in RequestScheduler._times(row[2])) if row else 0,
-                in_flight=sum(expires > now and RequestScheduler._alive(pid) for pid, expires in active))
+                in_flight=sum(RequestScheduler._alive(pid) for pid, expires in active))
