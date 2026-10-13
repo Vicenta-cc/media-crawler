@@ -1,9 +1,6 @@
-import asyncio
 import json
 import os
 import sqlite3
-from types import SimpleNamespace
-from unittest.mock import AsyncMock
 
 import pytest
 
@@ -40,37 +37,15 @@ def test_anonymous_publisher_emits_only_bound_identity_and_fixed_reason(tmp_path
 
 
 @pytest.mark.asyncio
-async def test_capacity_stop_reports_first_cause_without_transport_health(tmp_path,monkeypatch):
+async def test_closed_session_stops_locally_and_keeps_first_reason_without_transport_health(tmp_path,monkeypatch):
     session,context=managed_session(tmp_path)
     events=[]
     monkeypatch.setattr(bound_proxy,'emit_browser_guard_stopped',lambda snapshot,reason:events.append(reason))
-    try:
-        await session.open_context(context)
-        session._browser_capacity_wait_seconds=.02
-        for _ in range(32):session._reserve_browser_request()
-        stopped=await automatic_request(context)
-        stopped.abort.assert_awaited_once()
-        session._stop_background('PAGE_SIZES_FAILED')
-        assert events==['SHARED_ACTIVE_LIMIT']
-        with session.budget._connect() as db:
-            assert not db.execute('SELECT * FROM collection_route_health').fetchall()
-    finally:await session.close()
-
-
-@pytest.mark.asyncio
-async def test_actual_page_sizes_failure_reports_before_close_and_latches(tmp_path,monkeypatch):
-    session,context=managed_session(tmp_path)
-    events=[];callbacks={}
-    monkeypatch.setattr(bound_proxy,'emit_browser_guard_stopped',lambda snapshot,reason:events.append(reason))
-    page=SimpleNamespace(on=lambda event,callback:callbacks.update({event:callback}),close=AsyncMock(),is_closed=lambda:False)
-    context.pages.append(page);session.context=context
-    try:
-        session._monitor_page(page)
-        request=SimpleNamespace(sizes=AsyncMock(side_effect=RuntimeError('https://secret.invalid/password')))
-        callbacks['requestfinished'](request)
-        await asyncio.sleep(.01)
-        session._stop_background('PAGE_BYTE_LIMIT')
-        assert events==['PAGE_SIZES_FAILED'] and page.close.await_count>=1
-        with session.budget._connect() as db:
-            assert not db.execute('SELECT * FROM collection_route_health').fetchall()
-    finally:await session.close()
+    await session.open_context(context)
+    await session.close()
+    stopped=await automatic_request(context)
+    stopped.abort.assert_awaited_once()
+    session.record_browser_guard_stop('CDP_GUARD_TIMEOUT')
+    assert events==['BOUND_REQUEST_GUARD']
+    with session.budget._connect() as db:
+        assert not db.execute('SELECT * FROM collection_route_health').fetchall()

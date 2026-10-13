@@ -82,7 +82,7 @@ async def test_http_429_blocks_automatic_requests_for_neighbors_and_independent_
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize('blocked_scope', ['platform', 'account', 'exit', 'service_exit'])
-async def test_each_scope_cooldown_denies_browser_reservation_without_spending_capacity(
+async def test_each_scope_cooldown_denies_rendering_without_spending_business_budget(
         tmp_path, monkeypatch, blocked_scope):
     from tools.persistent_request_gate import enter_cooldown_scopes
     session, context = managed_session(tmp_path, mode='direct_degraded')
@@ -94,17 +94,13 @@ async def test_each_scope_cooldown_denies_browser_reservation_without_spending_c
         enter_cooldown_scopes(session.snapshot.scheduler_db_path,
             [names[blocked_scope]], 'HTTP 429', 9, now=now)
         with pytest.raises(route.CollectionRouteError, match='PROXY_UNAVAILABLE'):
-            session._reserve_browser_request()
+            session._validate_browser_safety()
         monkeypatch.setattr(bound_module.time, 'time', lambda: now + 10)
-        # The refused reservation must leave all forty direct-browser slots available.
-        for _ in range(40):
+        # Cooldown release permits ordinary rendering, without a resource quota.
+        for _ in range(350):
             intercepted = await automatic_request(context)
             intercepted.fallback.assert_awaited_once()
             intercepted.abort.assert_not_awaited()
-            session._release_browser_request(intercepted.request)
-        exhausted = await automatic_request(context)
-        exhausted.abort.assert_awaited_once()
-        exhausted.fallback.assert_not_awaited()
     finally:
         await session.close()
 

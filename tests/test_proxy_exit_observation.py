@@ -1,4 +1,3 @@
-import asyncio
 import json
 import sqlite3
 import time
@@ -197,28 +196,6 @@ def test_receipt_pipe_public_exact_and_nonblocking(tmp_path):
         assert not emit_probe_receipt(value,receipt,env={'MEDIACRAWLER_PROXY_RECEIPT_FD':str(r)})
     finally:
         os.close(r);os.close(w)
-
-
-@pytest.mark.asyncio
-async def test_background_growth_counter_stops_pages_and_business(tmp_path):
-    value,context,_=session(tmp_path)
-    await value.open_context(context)
-    callbacks={}
-    class Page(FakePage):
-        def on(self,event,callback):
-            callbacks[event]=callback
-        def is_closed(self):
-            return self.closed
-    page=Page(context)
-    context.pages.append(page)
-    value._monitor_page(page)
-    for _ in range(121):
-        callbacks['request'](object())
-    await asyncio.sleep(.01)
-    assert page.closed
-    with pytest.raises(CollectionRouteError,match='PROXY_UNAVAILABLE'):
-        await value.ensure_business()
-    await value.close()
 
 
 @pytest.mark.asyncio
@@ -426,43 +403,6 @@ async def test_http_echo_custom_user_agent_without_platform_credentials(tmp_path
         assert options[0]['verify'] is True
     finally:
         await value.close()
-
-
-@pytest.mark.asyncio
-async def test_trial_login_bootstrap_first_minute_keeps_total_cap_then_normal_rolling(tmp_path, monkeypatch):
-    monkeypatch.delenv('MEDIACRAWLER_PROXY_TRIAL_ID', raising=False)
-    value, _, _ = session(tmp_path, trial_id='trial-login', login_bootstrap=True)
-    callbacks = {}
-    class CounterPage:
-        def on(self, event, callback):
-            callbacks[event] = callback
-        def is_closed(self):
-            return False
-    page = CounterPage()
-    try:
-        value._monitor_page(page)
-        for _ in range(121):
-            callbacks['request'](object())
-        assert value._stopped is None
-        for _ in range(179):
-            callbacks['request'](object())
-        assert value._stopped is None
-        callbacks['request'](object())
-        assert value._stopped == 'PROXY_UNAVAILABLE'
-    finally:
-        await value.close()
-
-    later, _, _ = session(tmp_path, trial_id='trial-later', login_bootstrap=True)
-    callbacks.clear()
-    page = CounterPage()
-    try:
-        later._monitor_page(page)
-        later._page_counts[id(page)]['opened'] -= 61
-        for _ in range(121):
-            callbacks['request'](object())
-        assert later._stopped == 'PROXY_UNAVAILABLE'
-    finally:
-        await later.close()
 
 
 def test_login_bootstrap_requires_explicit_bool_and_trial_identity(tmp_path, monkeypatch):

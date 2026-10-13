@@ -315,17 +315,8 @@ class BoundProxySession:
         self._stopped = None
         self._on_probe_page = None
         self._gate = None
-        self._counter_tasks = set()
-        self._page_counts = {}
-        self._browser_tokens = {}
-        self._browser_capacity_lock = asyncio.Lock()
-        self._browser_capacity_changed = asyncio.Event()
-        self._browser_capacity_wait_seconds = 10
-        self._browser_pending_count = 0
+        self._background_tasks = set()
         self._browser_closed = False
-        self._browser_opened_at = time.time()
-        with self.budget._connect() as db:
-            db.execute('CREATE TABLE IF NOT EXISTS collection_browser_requests (token TEXT PRIMARY KEY,exit_key TEXT NOT NULL,pid INTEGER NOT NULL,started_at REAL NOT NULL,active INTEGER NOT NULL)')
         self._echo_context_handler = None
         self._receipt_delivered = False
         self.trial_limits = None
@@ -411,8 +402,7 @@ class BoundProxySession:
                 if not is_probe and not request.url.startswith(echo_origin + '/'):
                     if self.snapshot.managed:
                         try:
-                            token = await self._wait_browser_request(request)
-                            self._browser_tokens[id(request)] = token
+                            self._validate_browser_safety()
                         except (CollectionRouteError, RuntimeError, sqlite3.Error) as exc:
                             reason=getattr(self,'_reservation_stop_reason',None) or ('BOUND_REQUEST_GUARD' if isinstance(exc,CollectionRouteError) else 'BOUND_DATABASE_GUARD' if isinstance(exc,sqlite3.Error) else 'BOUND_RUNTIME_GUARD')
                             self.record_browser_guard_stop(reason)
@@ -430,10 +420,6 @@ class BoundProxySession:
                 await route.continue_(headers=headers)
             self._echo_context_handler = context_echo_only
             await context.route(self._echo_pattern, context_echo_only)
-        if callable(getattr(context, 'on', None)):
-            context.on('page', self._monitor_page)
-            for page in list(context.pages):
-                self._monitor_page(page)
         try:
             await self._probe('open')
         except CollectionRouteError as exc:
@@ -445,7 +431,6 @@ class BoundProxySession:
 
     async def close(self):
         self._browser_closed=True
-        self._browser_capacity_changed.set()
         if self.receipt is not None and not self.maintenance_only:
             emit_probe_receipt(self.snapshot, self.receipt, closed=True)
         task, self._periodic_task = self._periodic_task, None
@@ -455,21 +440,20 @@ class BoundProxySession:
                 await task
             except asyncio.CancelledError:
                 pass
-        for counter_task in list(self._counter_tasks):
-            counter_task.cancel()
-        if self._counter_tasks:
-            await asyncio.gather(*self._counter_tasks, return_exceptions=True)
-        self._counter_tasks.clear()
-        self._page_counts.clear()
+        for background_task in list(self._background_tasks):
+            background_task.cancel()
+        if self._background_tasks:
+            await asyncio.gather(*self._background_tasks, return_exceptions=True)
+        self._background_tasks.clear()
         # Keep the echo-origin deny guard until the browser actually closes.
         # Removing it first lets a delayed browser favicon escape during teardown.
         self.context = None
         self.receipt = None
 
-    def _spawn_counter(self, coroutine):
+    def _spawn_background(self, coroutine):
         task = asyncio.create_task(coroutine)
-        self._counter_tasks.add(task)
-        task.add_done_callback(self._counter_tasks.discard)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
 
     def record_browser_guard_stop(self, reason):
         if reason not in BROWSER_GUARD_REASONS or getattr(self,'_browser_guard_first_reason',None):
@@ -479,10 +463,10 @@ class BoundProxySession:
 
     def _stop_background(self, reason=None):
         if reason is not None:self.record_browser_guard_stop(reason)
-        # Admission, pacing and counter stops are local safety decisions.
+        # Admission and cooldown stops are local safety decisions.
         self._stopped='PROXY_UNAVAILABLE'
         if self.context is not None:
-            self._spawn_counter(self._close_for_stop())
+            self._spawn_background(self._close_for_stop())
 
     async def _close_for_stop(self):
         # Close pages, not context: its patched close owns session task cleanup.
@@ -492,92 +476,15 @@ class BoundProxySession:
             except Exception:
                 pass
 
-    def _monitor_page(self, page):
-        key = id(page)
-        if key in self._page_counts:
-            return
-        state = {'requests': 0, 'bytes': 0, 'times': [], 'opened': time.monotonic()}
-        self._page_counts[key] = state
-
-        def request_started(request):
-            if getattr(page, '_collection_proxy_probe', False):
-                return
-            now = time.monotonic()
-            state['requests'] += 1
-            state['times'] = [stamp for stamp in state['times'] if stamp > now - 60]
-            state['times'].append(now)
-            rolling_limit = 300 if self._login_bootstrap and now - state['opened'] < 60 else 120
-            if state['requests'] > 300 or len(state['times']) > rolling_limit or now - state['opened'] > 1200:
-                self._stop_background('PAGE_REQUEST_LIMIT' if state['requests']>300 else 'PAGE_ROLLING_LIMIT' if len(state['times'])>rolling_limit else 'PAGE_LIFETIME_LIMIT')
-
-        async def request_finished(request):
-            if getattr(page, '_collection_proxy_probe', False):
-                return
-            try:
-                sizes = await request.sizes()
-                state['bytes'] += sizes['responseBodySize'] + sizes['responseHeadersSize']
-                if state['bytes'] > 50 * 1024 * 1024:
-                    self._stop_background('PAGE_BYTE_LIMIT')
-            except Exception:
-                # A byte counter that cannot be maintained isn't a safe run.
-                self._stop_background('PAGE_SIZES_FAILED')
-
-        async def lifetime():
-            await asyncio.sleep(1200)
-            if not getattr(page, '_collection_proxy_probe', False) and not page.is_closed():
-                self._stop_background('PAGE_LIFETIME_LIMIT')
-
-        if callable(getattr(page, 'on', None)):
-            page.on('request', request_started)
-            page.on('requestfinished', lambda request: (self._release_browser_request(request), self._spawn_counter(request_finished(request))))
-            page.on('requestfailed', self._release_browser_request)
-            self._spawn_counter(lifetime())
-
-    async def _wait_browser_request(self, request=None):
-        """Queue transient capacity only; every attempt revalidates all safety fences."""
-        if self._browser_pending_count>=300:
-            self.record_browser_guard_stop('BROWSER_QUEUE_LIMIT')
-            self._reservation_stop_reason='BROWSER_QUEUE_LIMIT'
-            _error('PROBE_BUDGET_EXHAUSTED')
-        self._browser_pending_count+=1
-        try:
-            async with asyncio.timeout(self._browser_capacity_wait_seconds):
-                async with self._browser_capacity_lock:
-                    while True:
-                        self._reservation_stop_reason=None
-                        if self._browser_closed:
-                            _error('PROXY_UNAVAILABLE')
-                        try:
-                            page=request.frame.page if request is not None else None
-                        except (AttributeError,RuntimeError):
-                            page=None
-                        if page is not None and page.is_closed():
-                            _error('PROXY_UNAVAILABLE')
-                        self.check_stop()
-                        self._browser_capacity_changed.clear()
-                        try:
-                            return self._reserve_browser_request()
-                        except CollectionRouteError:
-                            if self._reservation_stop_reason!='SHARED_ACTIVE_LIMIT':
-                                raise
-                        try:
-                            await asyncio.wait_for(self._browser_capacity_changed.wait(),.1)
-                        except asyncio.TimeoutError:
-                            pass  # Other processes release through the shared ledger.
-        except asyncio.TimeoutError:
-            self._reservation_stop_reason='SHARED_ACTIVE_LIMIT'
-            _error('PROBE_BUDGET_EXHAUSTED')
-        finally:
-            self._browser_pending_count-=1
-
-    def _reserve_browser_request(self):
-        """Fence automatic browser traffic and bound shared-exit concurrency."""
-        from tools.persistent_request_gate import RequestScheduler
-        now = time.time()
+    def _validate_browser_safety(self):
+        """Fence rendering traffic without consuming business request budgets."""
         self._reservation_stop_reason=None
+        if self._browser_closed:
+            _error('PROXY_UNAVAILABLE')
+        self.check_stop()
+        now = time.time()
         fence = self._safety_fence()
         key = self.snapshot.observed_exit_ip
-        token = uuid4().hex
         with self.budget._connect() as db:
             if fence:
                 db.execute('ATTACH DATABASE ? AS safety', (fence['db_path'],))
@@ -599,29 +506,6 @@ class BoundProxySession:
                 if cooldown and cooldown[0]>now:
                     self._reservation_stop_reason='SHARED_COOLDOWN_GUARD'
                     _error('PROXY_UNAVAILABLE')
-            for previous, pid in db.execute('SELECT token,pid FROM collection_browser_requests WHERE active=1').fetchall():
-                if not RequestScheduler._alive(pid):
-                    db.execute('UPDATE collection_browser_requests SET active=0 WHERE token=?',(previous,))
-            db.execute('DELETE FROM collection_browser_requests WHERE active=0 AND started_at<?',(now-60,))
-            count, active = db.execute('SELECT COUNT(*),COALESCE(SUM(active),0) FROM collection_browser_requests WHERE exit_key=? AND (started_at>? OR active=1)',(key,now-60)).fetchone()
-            rolling, concurrent = (40,16) if self.snapshot.route_mode == 'direct_degraded' else (120,32)
-            if self._login_bootstrap and now-self._browser_opened_at < 60:
-                rolling, concurrent = 300,32
-            if count >= rolling or active >= concurrent:
-                self._reservation_stop_reason='SHARED_REQUEST_LIMIT' if count>=rolling else 'SHARED_ACTIVE_LIMIT'
-                _error('PROBE_BUDGET_EXHAUSTED')
-            db.execute('INSERT INTO collection_browser_requests VALUES(?,?,?,?,1)',(token,key,os.getpid(),now))
-        return token
-
-    def _release_browser_request(self, request):
-        token = self._browser_tokens.pop(id(request),None)
-        if token:
-            self._release_browser_token(token)
-
-    def _release_browser_token(self, token):
-        with self.budget._connect() as db:
-            db.execute('UPDATE collection_browser_requests SET active=0 WHERE token=?',(token,))
-        self._browser_capacity_changed.set()
 
     async def _periodic_probe(self):
         try:
