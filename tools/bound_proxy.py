@@ -371,7 +371,7 @@ class BoundProxySession:
         error = CollectionRouteError(code)
         self._stopped = error.code
         transport=error.code in {'PROXY_AUTH_FAILED','PROXY_CONNECTION_REFUSED','PROXY_TRANSPORT_FAILED','PROXY_EXPIRED','PROXY_EXIT_CHANGED'}
-        if transport or not self.snapshot.managed:
+        if transport or (not self.snapshot.managed and not self.maintenance_only):
             try:
                 with self.budget._connect() as db:
                     db.execute('INSERT OR REPLACE INTO collection_route_health VALUES(?,?,?)',
