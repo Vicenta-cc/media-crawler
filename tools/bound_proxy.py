@@ -410,7 +410,7 @@ class BoundProxySession:
                             token = self._reserve_browser_request()
                             self._browser_tokens[id(request)] = token
                         except (CollectionRouteError, RuntimeError, sqlite3.Error) as exc:
-                            reason=getattr(self,'_reservation_stop_reason',None) or ('BOUND_DATABASE_GUARD' if isinstance(exc,sqlite3.Error) else 'BOUND_RUNTIME_GUARD' if isinstance(exc,RuntimeError) else 'BOUND_REQUEST_GUARD')
+                            reason=getattr(self,'_reservation_stop_reason',None) or ('BOUND_REQUEST_GUARD' if isinstance(exc,CollectionRouteError) else 'BOUND_DATABASE_GUARD' if isinstance(exc,sqlite3.Error) else 'BOUND_RUNTIME_GUARD')
                             self.record_browser_guard_stop(reason)
                             await route.abort()
                             self._stop_background()

@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import sqlite3
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -8,6 +9,20 @@ import pytest
 
 from tests.test_bound_proxy_safety_regressions import managed_session, automatic_request
 from tools import bound_proxy
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('error,reason',[(bound_proxy.CollectionRouteError('PROXY_UNAVAILABLE'),'BOUND_REQUEST_GUARD'),(RuntimeError('private'),'BOUND_RUNTIME_GUARD'),(sqlite3.OperationalError('private'),'BOUND_DATABASE_GUARD')])
+async def test_request_guard_preserves_route_runtime_database_first_cause(tmp_path,monkeypatch,error,reason):
+    session,context=managed_session(tmp_path);events=[]
+    monkeypatch.setattr(bound_proxy,'emit_browser_guard_stopped',lambda snapshot,value:events.append(value))
+    try:
+        await session.open_context(context)
+        def stopped():raise error
+        monkeypatch.setattr(session,'check_stop',stopped)
+        (await automatic_request(context)).abort.assert_awaited_once()
+        assert events==[reason]
+    finally:await session.close()
 
 
 def test_anonymous_publisher_emits_only_bound_identity_and_fixed_reason(tmp_path,monkeypatch):
