@@ -90,7 +90,7 @@ def emit_account_risk(snapshot):
 BROWSER_GUARD_REASONS = frozenset({'BOUND_REQUEST_GUARD','BOUND_RUNTIME_GUARD','BOUND_DATABASE_GUARD',
     'SHARED_ADMISSION_GUARD','SHARED_COOLDOWN_GUARD','SHARED_REQUEST_LIMIT','SHARED_ACTIVE_LIMIT',
     'PAGE_REQUEST_LIMIT','PAGE_ROLLING_LIMIT','PAGE_LIFETIME_LIMIT','PAGE_BYTE_LIMIT','PAGE_SIZES_FAILED',
-    'CDP_GUARD_TIMEOUT','CDP_GUARD_FAILED','PERIODIC_PROBE_GUARD'})
+    'CDP_GUARD_TIMEOUT','CDP_GUARD_FAILED','PERIODIC_PROBE_GUARD','BROWSER_QUEUE_LIMIT'})
 
 
 def emit_browser_guard_stopped(snapshot, reason):
@@ -321,6 +321,7 @@ class BoundProxySession:
         self._browser_capacity_lock = asyncio.Lock()
         self._browser_capacity_changed = asyncio.Event()
         self._browser_capacity_wait_seconds = 10
+        self._browser_pending_count = 0
         self._browser_closed = False
         self._browser_opened_at = time.time()
         with self.budget._connect() as db:
@@ -534,6 +535,11 @@ class BoundProxySession:
 
     async def _wait_browser_request(self, request=None):
         """Queue transient capacity only; every attempt revalidates all safety fences."""
+        if self._browser_pending_count>=300:
+            self.record_browser_guard_stop('BROWSER_QUEUE_LIMIT')
+            self._reservation_stop_reason='BROWSER_QUEUE_LIMIT'
+            _error('PROBE_BUDGET_EXHAUSTED')
+        self._browser_pending_count+=1
         try:
             async with asyncio.timeout(self._browser_capacity_wait_seconds):
                 async with self._browser_capacity_lock:
@@ -561,6 +567,8 @@ class BoundProxySession:
         except asyncio.TimeoutError:
             self._reservation_stop_reason='SHARED_ACTIVE_LIMIT'
             _error('PROBE_BUDGET_EXHAUSTED')
+        finally:
+            self._browser_pending_count-=1
 
     def _reserve_browser_request(self):
         """Fence automatic browser traffic and bound shared-exit concurrency."""

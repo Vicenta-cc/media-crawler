@@ -14,6 +14,26 @@ def active(session):
 
 
 @pytest.mark.asyncio
+async def test_pending_queue_is_hard_bounded_and_cancellation_releases_only_queue_count(tmp_path):
+    session,context=managed_session(tmp_path);pending=[]
+    try:
+        await session.open_context(context)
+        for _ in range(32):session._reserve_browser_request()
+        pending=[asyncio.create_task(automatic_request(context)) for _ in range(300)]
+        await asyncio.sleep(.01)
+        assert session._browser_pending_count==300 and active(session)==32
+        overflow=await automatic_request(context)
+        overflow.abort.assert_awaited_once();overflow.fallback.assert_not_awaited()
+        assert session._browser_guard_first_reason=='BROWSER_QUEUE_LIMIT'
+        for task in pending:task.cancel()
+        await asyncio.gather(*pending,return_exceptions=True)
+        assert session._browser_pending_count==0 and active(session)==32
+    finally:
+        for task in pending:task.cancel()
+        await session.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize('mode,limit',[('proxy_required',32),('direct_degraded',16)])
 @pytest.mark.parametrize('cross_process',[False,True])
 async def test_registered_route_waits_then_atomically_resumes_without_exceeding_cap(tmp_path,mode,limit,cross_process):
@@ -54,6 +74,7 @@ async def test_session_close_keeps_live_browser_capacity_until_actual_request_en
         session._release_browser_request(routes[0].request)
         (await asyncio.wait_for(pending,1)).fallback.assert_awaited_once()
         assert active(session)==32
+        assert session._browser_pending_count==0
     finally:await session.close();await neighbor.close()
 
 
