@@ -318,6 +318,10 @@ class BoundProxySession:
         self._counter_tasks = set()
         self._page_counts = {}
         self._browser_tokens = {}
+        self._browser_capacity_lock = asyncio.Lock()
+        self._browser_capacity_changed = asyncio.Event()
+        self._browser_capacity_wait_seconds = 10
+        self._browser_closed = False
         self._browser_opened_at = time.time()
         with self.budget._connect() as db:
             db.execute('CREATE TABLE IF NOT EXISTS collection_browser_requests (token TEXT PRIMARY KEY,exit_key TEXT NOT NULL,pid INTEGER NOT NULL,started_at REAL NOT NULL,active INTEGER NOT NULL)')
@@ -406,8 +410,7 @@ class BoundProxySession:
                 if not is_probe and not request.url.startswith(echo_origin + '/'):
                     if self.snapshot.managed:
                         try:
-                            self.check_stop()
-                            token = self._reserve_browser_request()
+                            token = await self._wait_browser_request(request)
                             self._browser_tokens[id(request)] = token
                         except (CollectionRouteError, RuntimeError, sqlite3.Error) as exc:
                             reason=getattr(self,'_reservation_stop_reason',None) or ('BOUND_REQUEST_GUARD' if isinstance(exc,CollectionRouteError) else 'BOUND_DATABASE_GUARD' if isinstance(exc,sqlite3.Error) else 'BOUND_RUNTIME_GUARD')
@@ -440,6 +443,8 @@ class BoundProxySession:
         return self.receipt
 
     async def close(self):
+        self._browser_closed=True
+        self._browser_capacity_changed.set()
         if self.receipt is not None and not self.maintenance_only:
             emit_probe_receipt(self.snapshot, self.receipt, closed=True)
         task, self._periodic_task = self._periodic_task, None
@@ -527,6 +532,36 @@ class BoundProxySession:
             page.on('requestfailed', self._release_browser_request)
             self._spawn_counter(lifetime())
 
+    async def _wait_browser_request(self, request=None):
+        """Queue transient capacity only; every attempt revalidates all safety fences."""
+        try:
+            async with asyncio.timeout(self._browser_capacity_wait_seconds):
+                async with self._browser_capacity_lock:
+                    while True:
+                        self._reservation_stop_reason=None
+                        if self._browser_closed:
+                            _error('PROXY_UNAVAILABLE')
+                        try:
+                            page=request.frame.page if request is not None else None
+                        except (AttributeError,RuntimeError):
+                            page=None
+                        if page is not None and page.is_closed():
+                            _error('PROXY_UNAVAILABLE')
+                        self.check_stop()
+                        self._browser_capacity_changed.clear()
+                        try:
+                            return self._reserve_browser_request()
+                        except CollectionRouteError:
+                            if self._reservation_stop_reason!='SHARED_ACTIVE_LIMIT':
+                                raise
+                        try:
+                            await asyncio.wait_for(self._browser_capacity_changed.wait(),.1)
+                        except asyncio.TimeoutError:
+                            pass  # Other processes release through the shared ledger.
+        except asyncio.TimeoutError:
+            self._reservation_stop_reason='SHARED_ACTIVE_LIMIT'
+            _error('PROBE_BUDGET_EXHAUSTED')
+
     def _reserve_browser_request(self):
         """Fence automatic browser traffic and bound shared-exit concurrency."""
         from tools.persistent_request_gate import RequestScheduler
@@ -573,8 +608,12 @@ class BoundProxySession:
     def _release_browser_request(self, request):
         token = self._browser_tokens.pop(id(request),None)
         if token:
-            with self.budget._connect() as db:
-                db.execute('UPDATE collection_browser_requests SET active=0 WHERE token=?',(token,))
+            self._release_browser_token(token)
+
+    def _release_browser_token(self, token):
+        with self.budget._connect() as db:
+            db.execute('UPDATE collection_browser_requests SET active=0 WHERE token=?',(token,))
+        self._browser_capacity_changed.set()
 
     async def _periodic_probe(self):
         try:

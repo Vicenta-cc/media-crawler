@@ -46,6 +46,7 @@ async def test_capacity_stop_reports_first_cause_without_transport_health(tmp_pa
     monkeypatch.setattr(bound_proxy,'emit_browser_guard_stopped',lambda snapshot,reason:events.append(reason))
     try:
         await session.open_context(context)
+        session._browser_capacity_wait_seconds=.02
         for _ in range(32):session._reserve_browser_request()
         stopped=await automatic_request(context)
         stopped.abort.assert_awaited_once()
