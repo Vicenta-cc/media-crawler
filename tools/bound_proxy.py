@@ -21,6 +21,9 @@ from tools.collection_route import (
 )
 
 
+BROWSER_ECHO_TIMEOUT_SECONDS = 30
+
+
 def _error(code='PROXY_CONFIG_INVALID'):
     raise CollectionRouteError(code)
 
@@ -584,7 +587,7 @@ class BoundProxySession:
                 const body = new Uint8Array(size); let offset = 0;
                 for (const chunk of chunks) {body.set(chunk, offset); offset += chunk.byteLength;}
                 return {status: response.status, body: new TextDecoder('utf-8', {fatal: true}).decode(body)};
-            }""", self.echo_url), timeout=10)
+            }""", self.echo_url), timeout=BROWSER_ECHO_TIMEOUT_SECONDS)
             if not isinstance(sample, dict) or set(sample) != {'status', 'body'} or sample['status'] != 200:
                 _error('PROXY_AUTH_FAILED' if isinstance(sample, dict) and sample.get('status') == 407 else 'PROXY_UNAVAILABLE')
             return parse_exit_sample(sample['body'])

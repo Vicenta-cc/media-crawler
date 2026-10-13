@@ -1,3 +1,4 @@
+import asyncio
 import json
 import sqlite3
 import time
@@ -100,6 +101,25 @@ async def test_unknown_exit_bootstrap_initial_two_pairs_context_scope_and_cleanu
         assert all('%E5%AF%86%23%2F%3F%40%3A' in option['proxy'] for option in options)
         async with value.slot():
             pass
+    finally:
+        await value.close()
+
+
+@pytest.mark.asyncio
+async def test_browser_echo_allows_proxy_cold_start_window(tmp_path, monkeypatch):
+    value, context, _ = session(tmp_path)
+    value.context = context
+    observed_timeouts = []
+    original_wait_for = asyncio.wait_for
+
+    async def recording_wait_for(awaitable, timeout):
+        observed_timeouts.append(timeout)
+        return await original_wait_for(awaitable, timeout)
+
+    monkeypatch.setattr(asyncio, 'wait_for', recording_wait_for)
+    try:
+        assert await value._browser_sample() == '203.0.113.1'
+        assert observed_timeouts == [30]
     finally:
         await value.close()
 
