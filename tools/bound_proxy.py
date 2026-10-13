@@ -387,7 +387,11 @@ class BoundProxySession:
             _error()
         self.context, self.context_id = context, self.snapshot.context_id if self.snapshot.managed else context_id or uuid4().hex
         self._on_probe_page = on_probe_page
-        if callable(getattr(context, 'route', None)):
+        # Login V2 intentionally uses CDP document guards. Playwright routing
+        # disables Chromium's cache and can leave the login shell perpetually
+        # hydrating. The browser context is already pinned to this immutable
+        # proxy snapshot, while login navigation/actions use bound slots.
+        if callable(getattr(context, 'route', None)) and not self._login_bootstrap:
             # Chromium's implicit favicon request is context-level; page.route
             # alone does not intercept it. Keep an echo-origin-only deny guard.
             parsed_echo = urlsplit(self.echo_url)

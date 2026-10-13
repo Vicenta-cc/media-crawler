@@ -12,6 +12,24 @@ from tests.test_bound_proxy_safety_regressions import managed_session, automatic
 
 
 @pytest.mark.asyncio
+async def test_login_bootstrap_preserves_login_v2_cache_and_cdp_path(tmp_path):
+    session,context=managed_session(tmp_path)
+    session._login_bootstrap=True
+    context_route_calls=0
+    original_route=context.route
+    async def tracked_route(pattern,callback):
+        nonlocal context_route_calls
+        context_route_calls+=1
+        await original_route(pattern,callback)
+    context.route=tracked_route
+    try:
+        await session.open_context(context)
+        assert context_route_calls==0
+        assert session.receipt is not None
+    finally:await session.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize('mode',['proxy_required','direct_degraded'])
 async def test_rendering_over_300_resources_ignores_old_capacity_and_preserves_business_quota(tmp_path,mode):
     session,context=managed_session(tmp_path,mode=mode)
