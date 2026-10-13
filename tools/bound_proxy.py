@@ -87,6 +87,26 @@ def emit_account_risk(snapshot):
         return False
 
 
+BROWSER_GUARD_REASONS = frozenset({'BOUND_REQUEST_GUARD','BOUND_RUNTIME_GUARD','BOUND_DATABASE_GUARD',
+    'SHARED_ADMISSION_GUARD','SHARED_COOLDOWN_GUARD','SHARED_REQUEST_LIMIT','SHARED_ACTIVE_LIMIT',
+    'PAGE_REQUEST_LIMIT','PAGE_ROLLING_LIMIT','PAGE_LIFETIME_LIMIT','PAGE_BYTE_LIMIT','PAGE_SIZES_FAILED',
+    'CDP_GUARD_TIMEOUT','CDP_GUARD_FAILED','PERIODIC_PROBE_GUARD'})
+
+
+def emit_browser_guard_stopped(snapshot, reason):
+    if not snapshot.managed or reason not in BROWSER_GUARD_REASONS:
+        return False
+    try:
+        fd=int(os.environ['MEDIACRAWLER_PROXY_RECEIPT_FD'])
+        value=dict(type='browser_guard_stopped',operation_id=snapshot.operation_id,owner_id=snapshot.owner_id,
+            lease_version=snapshot.lease_version,snapshot_digest=snapshot.snapshot_digest,context_id=snapshot.context_id,reason=reason)
+        data=(json.dumps(value,allow_nan=False)+'\n').encode()
+        os.set_blocking(fd,False)
+        return os.write(fd,data)==len(data)
+    except (OSError,ValueError,KeyError):
+        return False
+
+
 def emit_probe_receipt(snapshot, receipt, *, closed=False, env=None):
     """Best-effort nonblocking public ACK pipe. False means parent must defer."""
     env = os.environ if env is None else env
@@ -389,7 +409,9 @@ class BoundProxySession:
                             self.check_stop()
                             token = self._reserve_browser_request()
                             self._browser_tokens[id(request)] = token
-                        except (CollectionRouteError, RuntimeError, sqlite3.Error):
+                        except (CollectionRouteError, RuntimeError, sqlite3.Error) as exc:
+                            reason=getattr(self,'_reservation_stop_reason',None) or ('BOUND_DATABASE_GUARD' if isinstance(exc,sqlite3.Error) else 'BOUND_RUNTIME_GUARD' if isinstance(exc,RuntimeError) else 'BOUND_REQUEST_GUARD')
+                            self.record_browser_guard_stop(reason)
                             await route.abort()
                             self._stop_background()
                             return
@@ -443,7 +465,14 @@ class BoundProxySession:
         self._counter_tasks.add(task)
         task.add_done_callback(self._counter_tasks.discard)
 
-    def _stop_background(self):
+    def record_browser_guard_stop(self, reason):
+        if reason not in BROWSER_GUARD_REASONS or getattr(self,'_browser_guard_first_reason',None):
+            return
+        self._browser_guard_first_reason=reason
+        emit_browser_guard_stopped(self.snapshot,reason)
+
+    def _stop_background(self, reason=None):
+        if reason is not None:self.record_browser_guard_stop(reason)
         # Admission, pacing and counter stops are local safety decisions.
         self._stopped='PROXY_UNAVAILABLE'
         if self.context is not None:
@@ -473,7 +502,7 @@ class BoundProxySession:
             state['times'].append(now)
             rolling_limit = 300 if self._login_bootstrap and now - state['opened'] < 60 else 120
             if state['requests'] > 300 or len(state['times']) > rolling_limit or now - state['opened'] > 1200:
-                self._stop_background()
+                self._stop_background('PAGE_REQUEST_LIMIT' if state['requests']>300 else 'PAGE_ROLLING_LIMIT' if len(state['times'])>rolling_limit else 'PAGE_LIFETIME_LIMIT')
 
         async def request_finished(request):
             if getattr(page, '_collection_proxy_probe', False):
@@ -482,15 +511,15 @@ class BoundProxySession:
                 sizes = await request.sizes()
                 state['bytes'] += sizes['responseBodySize'] + sizes['responseHeadersSize']
                 if state['bytes'] > 50 * 1024 * 1024:
-                    self._stop_background()
+                    self._stop_background('PAGE_BYTE_LIMIT')
             except Exception:
                 # A byte counter that cannot be maintained isn't a safe run.
-                self._stop_background()
+                self._stop_background('PAGE_SIZES_FAILED')
 
         async def lifetime():
             await asyncio.sleep(1200)
             if not getattr(page, '_collection_proxy_probe', False) and not page.is_closed():
-                self._stop_background()
+                self._stop_background('PAGE_LIFETIME_LIMIT')
 
         if callable(getattr(page, 'on', None)):
             page.on('request', request_started)
@@ -502,6 +531,7 @@ class BoundProxySession:
         """Fence automatic browser traffic and bound shared-exit concurrency."""
         from tools.persistent_request_gate import RequestScheduler
         now = time.time()
+        self._reservation_stop_reason=None
         fence = self._safety_fence()
         key = self.snapshot.observed_exit_ip
         token = uuid4().hex
@@ -519,10 +549,12 @@ class BoundProxySession:
                 if (not row or row[0] != self.snapshot.exit_generation or (row[3] and not recovery)
                         or not 0 <= now-row[1] <= 300 or (row[2] is not None and row[2] > now and not (recovery and account[1]=='manual_claimed'))
                         or not admission or tuple(admission) != (self.snapshot.account_id,key,self.snapshot.exit_generation,'active')):
+                    self._reservation_stop_reason='SHARED_ADMISSION_GUARD'
                     _error('PROXY_UNAVAILABLE')
             for scope in self.snapshot.scope_ids:
                 cooldown=db.execute('SELECT cooldown_until FROM request_scheduler_state WHERE platform=?',(scope,)).fetchone()
                 if cooldown and cooldown[0]>now:
+                    self._reservation_stop_reason='SHARED_COOLDOWN_GUARD'
                     _error('PROXY_UNAVAILABLE')
             for previous, pid in db.execute('SELECT token,pid FROM collection_browser_requests WHERE active=1').fetchall():
                 if not RequestScheduler._alive(pid):
@@ -533,6 +565,7 @@ class BoundProxySession:
             if self._login_bootstrap and now-self._browser_opened_at < 60:
                 rolling, concurrent = 300,32
             if count >= rolling or active >= concurrent:
+                self._reservation_stop_reason='SHARED_REQUEST_LIMIT' if count>=rolling else 'SHARED_ACTIVE_LIMIT'
                 _error('PROBE_BUDGET_EXHAUSTED')
             db.execute('INSERT INTO collection_browser_requests VALUES(?,?,?,?,1)',(token,key,os.getpid(),now))
         return token
@@ -556,6 +589,7 @@ class BoundProxySession:
         except CollectionRouteError as exc:
             self._stopped = exc.code
             if self.context:
+                self.record_browser_guard_stop('PERIODIC_PROBE_GUARD')
                 await self.context.close()
 
     async def _browser_sample(self):
