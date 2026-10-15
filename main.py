@@ -101,6 +101,9 @@ async def main() -> None:
     global crawler
 
     args = await cmd_arg.parse_cmd()
+    # Validate the dedicated secret FD before database/browser/HTTP factories.
+    from tools.bound_proxy import initialize_bound_route
+    initialize_bound_route(platform=config.PLATFORM)
     if args.init_db:
         await db.init_db(args.init_db)
         print(f"Database {args.init_db} initialized successfully.")

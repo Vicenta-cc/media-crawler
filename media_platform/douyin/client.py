@@ -34,6 +34,7 @@ from base.base_crawler import AbstractApiClient
 from proxy.proxy_mixin import ProxyRefreshMixin
 from tools import utils
 from tools.httpx_util import make_async_client
+from tools.collection_route import CollectionRouteError
 from tools.persistent_request_gate import PersistentRequestGate, configured_gate, scheduler_db_path
 from var import request_keyword_var
 
@@ -60,14 +61,20 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
 
     def __init__(
         self,
-        timeout=60,  # If the crawl media option is turned on, Douyin’s short videos will require a longer timeout.
+        timeout=60,  # HTTPX per-operation inactivity timeout; media has no independent wall deadline.
         proxy=None,
         *,
         headers: Dict,
         playwright_page: Optional[Page],
         cookie_dict: Dict,
         proxy_ip_pool: Optional["ProxyIpPool"] = None,
+        bound_proxy_session=None,
     ):
+        self._bound_proxy_session = bound_proxy_session
+        if bound_proxy_session is not None:
+            if proxy_ip_pool is not None:
+                raise CollectionRouteError('PROXY_CONFIG_INVALID')
+            proxy = bound_proxy_session.snapshot.httpx_proxy()
         self.proxy = proxy
         self.timeout = timeout
         self.headers = headers
@@ -81,16 +88,20 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
         ]
         self.playwright_page = playwright_page
         self.cookie_dict = cookie_dict
-        self._persistent_gate = configured_gate(
-            db_path=config.DY_REQUEST_SCHEDULER_DB,
-            min_interval=config.DY_REQUEST_MIN_INTERVAL,
-            per_minute=config.DY_REQUESTS_PER_MINUTE,
-            max_concurrency=config.DY_REQUEST_CONCURRENCY,
-            media_interval=config.DY_MEDIA_REQUEST_INTERVAL,
-            cooldown_seconds=config.DY_REQUEST_COOLDOWN_SECONDS,
-            jitter=config.DY_PACING_JITTER,
-        )
-        self._account_gate = self._configured_account_gate()
+        if bound_proxy_session is not None:
+            self._persistent_gate = bound_proxy_session._gate
+            self._account_gate = None
+        else:
+            self._persistent_gate = configured_gate(
+                db_path=config.DY_REQUEST_SCHEDULER_DB,
+                min_interval=config.DY_REQUEST_MIN_INTERVAL,
+                per_minute=config.DY_REQUESTS_PER_MINUTE,
+                max_concurrency=config.DY_REQUEST_CONCURRENCY,
+                media_interval=config.DY_MEDIA_REQUEST_INTERVAL,
+                cooldown_seconds=config.DY_REQUEST_COOLDOWN_SECONDS,
+                jitter=config.DY_PACING_JITTER,
+            )
+            self._account_gate = self._configured_account_gate()
         # Initialize proxy pool (from ProxyRefreshMixin)
         self.init_proxy_pool(proxy_ip_pool)
 
@@ -203,37 +214,88 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
         control_text = json.dumps(control_values, ensure_ascii=False).lower()
         return any(marker in control_text for marker in cls._VERIFICATION_MARKERS)
 
-    async def _send(self, method, url, *, operation='api', timeout=None, follow_redirects=False, **kwargs):
+    async def _authority_safe_call(self, method, *args, **kwargs):
+        """Keep synchronous owner operations off the browser event loop."""
+        bound = self._bound_proxy_session
+        if bound is not None and getattr(bound, 'authority', None) is not None:
+            return await asyncio.to_thread(method, *args, **kwargs)
+        return method(*args, **kwargs)
+
+    async def _request_trial_media(self, client, method, url, *, timeout, token, **kwargs):
+        """Bounded accepted bytes; the last network chunk may already be buffered."""
+        bound = self._bound_proxy_session
+        try:
+            async with client.stream(method, url, timeout=timeout, follow_redirects=False, **kwargs) as response:
+                content = bytearray()
+                mime = response.headers.get('content-type', '').split(';')[0].lower()
+                if response.status_code == 200 and not mime.startswith('text/') and mime not in {
+                    'application/json', 'application/xml', 'application/xhtml+xml'}:
+                    async for chunk in response.aiter_bytes(chunk_size=65536):
+                        await self._authority_safe_call(bound.trial_limits.reserve_media_bytes, token, len(chunk))
+                        content.extend(chunk)
+                # aiter_bytes is decoded; don't apply Content-Encoding twice.
+                headers = {key: value for key, value in response.headers.items()
+                           if key.lower() not in ('content-encoding', 'content-length')}
+                return httpx.Response(response.status_code, headers=headers, content=bytes(content),
+                                      request=response.request)
+        except RuntimeError:
+            raise await self._authority_safe_call(bound.fail, 'PROBE_BUDGET_EXHAUSTED') from None
+
+    async def _send(self, method, url, *, operation='api', timeout=None, follow_redirects=False, trial_media_token=None, **kwargs):
         # Prepare the client/proxy before acquiring a slot; no second pacing wait
         # may separate the shared reservation from the actual transport call.
         await self._refresh_proxy_if_expired()
         timeout = self.timeout if timeout is None else timeout
-        async with make_async_client(proxy=self.proxy, follow_redirects=False) as client:
+        total_timeout = None if operation == 'media' else timeout
+        bound = self._bound_proxy_session
+        client_options = {'proxy': self.proxy, 'follow_redirects': False}
+        if bound is not None:
+            client_options.update(route_snapshot=bound.snapshot, verify=bound.verify)
+        async with make_async_client(**client_options) as client:
             for hop in range(11):
                 # Reserve the account first so the per-IP reservation stays next to the transport call.
                 account_gate = getattr(self, "_account_gate", None)
                 account_waited = await account_gate.acquire(operation) if account_gate else 0.0
-                async with self._persistent_gate.slot(operation, timeout=timeout) as waited:
-                    utils.logger.info(
-                        f"REQUEST_SCHEDULER operation={operation} waited_seconds={waited:.3f} "
-                        f"account_waited_seconds={account_waited:.3f}"
-                    )
-                    response = await client.request(method, url, timeout=timeout, follow_redirects=False, **kwargs)
-                    if response.status_code == 429:
-                        raw = response.headers.get('Retry-After', '')
+                gate = bound if bound is not None else self._persistent_gate
+                try:
+                    async with gate.slot(operation, timeout=total_timeout) as waited:
+                        utils.logger.info(
+                            f"REQUEST_SCHEDULER operation={operation} waited_seconds={waited:.3f} "
+                            f"account_waited_seconds={account_waited:.3f}"
+                        )
                         try:
-                            seconds = float(raw)
-                        except ValueError:
+                            if trial_media_token is not None:
+                                response = await self._request_trial_media(client, method, url, timeout=timeout,
+                                                                           token=trial_media_token, **kwargs)
+                            else:
+                                response = await client.request(method, url, timeout=timeout, follow_redirects=False, **kwargs)
+                        except httpx.HTTPError as exc:
+                            if bound is not None:
+                                from tools.bound_proxy import transport_error_code
+                                raise await self._authority_safe_call(bound.fail, transport_error_code(exc, managed=bound.snapshot.managed)) from None
+                            raise
+                        if bound is not None and response.status_code == 407:
+                            raise await self._authority_safe_call(bound.fail, 'PROXY_AUTH_FAILED')
+                        if response.status_code == 429:
+                            raw = response.headers.get('Retry-After', '')
                             try:
-                                seconds = parsedate_to_datetime(raw).timestamp() - time.time()
-                            except (TypeError, ValueError, OverflowError):
+                                seconds = float(raw)
+                            except ValueError:
+                                try:
+                                    seconds = parsedate_to_datetime(raw).timestamp() - time.time()
+                                except (TypeError, ValueError, OverflowError):
+                                    seconds = 0
+                            # Malformed values cannot clear the default shared cooldown.
+                            if not __import__('math').isfinite(seconds):
                                 seconds = 0
-                        # Malformed values cannot clear the default shared cooldown.
-                        if not __import__('math').isfinite(seconds):
-                            seconds = 0
-                        seconds = max(self._persistent_gate.state.cooldown_seconds, seconds)
-                        self._persistent_gate.state.enter_cooldown('HTTP 429', seconds)
-                        raise PlatformRateLimitedError('PLATFORM_RATE_LIMITED: HTTP 429; shared cooldown recorded')
+                            active_gate = bound._gate if bound is not None else self._persistent_gate
+                            seconds = max(active_gate.state.cooldown_seconds, seconds)
+                            await self._authority_safe_call(active_gate.state.enter_cooldown, 'HTTP 429', seconds)
+                            raise PlatformRateLimitedError('PLATFORM_RATE_LIMITED: HTTP 429; shared cooldown recorded')
+                except TimeoutError:
+                    if operation == 'media':
+                        raise MediaDownloadError('media_total_timeout') from None
+                    raise
                 if not follow_redirects or response.status_code not in (301, 302, 303, 307, 308):
                     return response
                 if hop == 10:
@@ -255,6 +317,10 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
             payload = None
 
         if self._requires_verification(response, payload):
+            if self._bound_proxy_session is not None:
+                from tools.bound_proxy import emit_account_risk
+                emit_account_risk(self._bound_proxy_session.snapshot)
+                self._bound_proxy_session._stopped = 'PROXY_UNAVAILABLE'
             utils.logger.error("ACCOUNT_VERIFY: platform request requires verification")
             raise DataFetchError("ACCOUNT_VERIFY")
         if response.status_code >= 400:
@@ -574,9 +640,29 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
             headers["User-Agent"] = self.headers["User-Agent"]
         host = urllib.parse.urlsplit(url).hostname
         final_host = host
+        bound = self._bound_proxy_session
+        trial = bound.trial_limits if bound is not None else None
+        trial_token = None
         try:
-            response = await self._send("GET", url, operation='media', headers=headers,
-                                        timeout=self.timeout, follow_redirects=True)
+            if trial is not None:
+                try:
+                    trial_token = await self._authority_safe_call(trial.begin_media)
+                    remaining = await self._authority_safe_call(trial.media_timeout, trial_token)
+                except RuntimeError:
+                    raise await self._authority_safe_call(bound.fail, 'PROBE_BUDGET_EXHAUSTED') from None
+                trial_deadline = asyncio.timeout(remaining)
+                try:
+                    async with trial_deadline:
+                        response = await self._send("GET", url, operation='media', headers=headers,
+                            timeout=min(self.timeout, remaining), follow_redirects=True,
+                            trial_media_token=trial_token)
+                except TimeoutError:
+                    if trial_deadline.expired():
+                        raise await self._authority_safe_call(bound.fail, 'PROBE_BUDGET_EXHAUSTED') from None
+                    raise
+            else:
+                response = await self._send("GET", url, operation='media', headers=headers,
+                                            timeout=self.timeout, follow_redirects=True)
             final_host = response.url.host
             if response.status_code != 200:
                 raise MediaDownloadError("media_http_error", response.status_code)
@@ -586,7 +672,8 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
             }:
                 raise MediaDownloadError("invalid_media_response", response.status_code)
             return response.content
-        except PlatformRateLimitedError:
+        except DataFetchError:
+            # Account verification and platform limits are not CDN candidates.
             raise
         except (httpx.HTTPError, MediaDownloadError) as exc:
             status = getattr(exc, "status_code", None)
@@ -600,6 +687,12 @@ class DouYinClient(AbstractApiClient, ProxyRefreshMixin):
                     raise
                 raise MediaDownloadError(type(exc).__name__) from None
             return None
+        finally:
+            if trial_token is not None:
+                try:
+                    await self._authority_safe_call(trial.finish_media, trial_token)
+                except RuntimeError:
+                    raise await self._authority_safe_call(bound.fail, 'PROBE_BUDGET_EXHAUSTED') from None
 
     async def resolve_short_url(self, short_url: str) -> str:
         """

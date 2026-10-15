@@ -192,23 +192,21 @@ def format_proxy_info(ip_proxy_info) -> Tuple[Optional[Dict], Optional[str]]:
     from proxy.proxy_ip_pool import IpInfoModel
     ip_proxy_info = cast(IpInfoModel, ip_proxy_info)
 
-    # Playwright proxy server should be in format "host:port" without protocol prefix
-    server = f"{ip_proxy_info.ip}:{ip_proxy_info.port}"
-    
-    playwright_proxy = {
-        "server": server,
-    }
-    
-    # Only add username and password if they are not empty
-    if ip_proxy_info.user and ip_proxy_info.password:
-        playwright_proxy["username"] = ip_proxy_info.user
-        playwright_proxy["password"] = ip_proxy_info.password
-    
-    # httpx 0.28.1 requires passing proxy URL string directly, not a dictionary
-    if ip_proxy_info.user and ip_proxy_info.password:
-        httpx_proxy = f"http://{ip_proxy_info.user}:{ip_proxy_info.password}@{ip_proxy_info.ip}:{ip_proxy_info.port}"
+    from urllib.parse import quote
+    # Legacy providers leave IpInfoModel.protocol at its historical HTTPS
+    # label, while this transport has always used HTTP ingress. Preserve that
+    # behavior; only the new BoundRoute envelope enforces explicit HTTP scheme.
+    host = str(ip_proxy_info.ip)
+    host = f"[{host}]" if ':' in host and not host.startswith('[') else host
+    server = f"http://{host}:{ip_proxy_info.port}"
+    playwright_proxy = {"server": server}
+    username, password = ip_proxy_info.user or '', ip_proxy_info.password or ''
+    if username or password:
+        playwright_proxy.update(username=username, password=password)
+        auth = quote(username, safe='') + ':' + quote(password, safe='')
+        httpx_proxy = f"http://{auth}@{host}:{ip_proxy_info.port}"
     else:
-        httpx_proxy = f"http://{ip_proxy_info.ip}:{ip_proxy_info.port}"
+        httpx_proxy = server
     return playwright_proxy, httpx_proxy
 
 

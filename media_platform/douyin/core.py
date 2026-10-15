@@ -21,12 +21,12 @@ import asyncio
 import functools
 import re
 import sqlite3
-import json
 from pathlib import Path
 import os
+import sys
 from contextlib import asynccontextmanager
 from asyncio import Task
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import httpx
 
@@ -37,7 +37,6 @@ from playwright.async_api import (
     BrowserType,
     Page,
     Playwright,
-    async_playwright,
 )
 
 import config
@@ -45,7 +44,10 @@ from base.base_crawler import AbstractCrawler
 from proxy.proxy_ip_pool import IpInfoModel, create_ip_pool
 from store import douyin as douyin_store
 from tools import utils
+from tools.reusable_content import reusable_aweme_is_complete
 from tools.browser_state import has_saved_cookie_state
+from tools.collection_route import CollectionRouteError
+from tools.bound_proxy import initialize_bound_route, BoundProxySession
 from tools.cdp_browser import CDPBrowserManager
 from tools.collection_status import (
     CollectionIncompleteError,
@@ -58,7 +60,6 @@ from .client import DouYinClient
 from .exception import DataFetchError, MediaDownloadError, PlatformRateLimitedError
 from .field import PublishTimeType, SearchSortType
 from .help import parse_video_info_from_url, parse_creator_info_from_url
-from .login import DouYinLogin
 from .pacing import jittered_sleep, record_content_ok, record_silent_risk, set_single_detail_target
 
 
@@ -73,46 +74,12 @@ def _compiled_skip_profile_regex(pattern: str) -> Optional["re.Pattern[str]"]:
         return None
 
 
-def reusable_aweme_is_complete(raw_item_path: str, content_key: str) -> bool:
-    """Validate the indexed payload and every media file it promises."""
-    try:
-        path = Path(str(raw_item_path))
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        item = payload.get("item") if isinstance(payload, dict) else None
-        if not isinstance(item, dict) or str(item.get("aweme_id") or "") != str(content_key):
-            return False
-        if not str(item.get("aweme_url") or "").strip():
-            return False
-        if path.parent.name != "raw_items":
-            return False
-        output_root = path.parent.parent
-        note_urls = item.get("note_download_url") or ""
-        if isinstance(note_urls, str):
-            note_urls = [value for value in note_urls.split(",") if value.strip()]
-        elif isinstance(note_urls, list):
-            note_urls = [value for value in note_urls if str(value).strip()]
-        else:
-            return False
-        if note_urls:
-            image_root = output_root / "crawler" / "douyin" / "images" / str(content_key)
-            for index in range(len(note_urls)):
-                media = image_root / f"{index:03d}.jpeg"
-                if not media.is_file() or media.stat().st_size == 0:
-                    return False
-                if media.read_bytes()[:2] != b"\xff\xd8":
-                    return False
-            return True
-        if not str(item.get("video_download_url") or "").strip():
-            return False
-        media = output_root / "crawler" / "douyin" / "videos" / str(content_key) / "video.mp4"
-        if not media.is_file() or media.stat().st_size == 0:
-            return False
-        return b"ftyp" in media.read_bytes()[:32]
-    except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError):
-        return False
 
 
 class DouYinCrawler(AbstractCrawler):
+    _bound_proxy_session = None
+    INDEX_NAVIGATION_TIMEOUT_SECONDS = 60
+    LOGIN_READINESS_TIMEOUT_SECONDS = 60
     context_page: Page
     dy_client: DouYinClient
     browser_context: BrowserContext
@@ -129,22 +96,22 @@ class DouYinCrawler(AbstractCrawler):
         ]
         self.cdp_manager = None
         self.ip_proxy_pool = None  # Proxy IP pool for automatic proxy refresh
-        self._cloak_profile = None
+        self._camoufox_profile = None
+        self._bound_proxy_session = None
 
     async def apply_account_auth_state(self, browser_context) -> bool:
-        if self._cloak_profile is None:
-            return await super().apply_account_auth_state(browser_context)
-        marker = self._cloak_profile["directory"] / "auth-imported"
-        if marker.exists():
-            return False  # Preserve newer state in this account's persistent profile.
-        restored = await super().apply_account_auth_state(browser_context)
-        if restored:
-            marker.touch(mode=0o600)
-        return restored
+        # A Firefox profile must authenticate in place. Chromium-era DB Cookie
+        # snapshots cannot initialize a new browser identity.
+        return False
 
     async def start(self) -> None:
         playwright_proxy_format, httpx_proxy_format = None, None
-        if config.ENABLE_IP_PROXY:
+        snapshot = initialize_bound_route(platform='dy')
+        if snapshot is not None:
+            self._bound_proxy_session = await asyncio.to_thread(BoundProxySession, snapshot)
+            playwright_proxy_format = snapshot.playwright_proxy()
+            httpx_proxy_format = snapshot.httpx_proxy()
+        elif config.ENABLE_IP_PROXY:
             self.ip_proxy_pool = await create_ip_pool(config.IP_PROXY_POOL_COUNT, enable_validate_ip=True)
             ip_proxy_info: IpInfoModel = await self.ip_proxy_pool.get_proxy()
             playwright_proxy_format, httpx_proxy_format = utils.format_proxy_info(ip_proxy_info)
@@ -163,7 +130,7 @@ class DouYinCrawler(AbstractCrawler):
             await self._open_index_page()
 
             self.dy_client = await self.create_douyin_client(httpx_proxy_format)
-            need_login = not await self.dy_client.pong(browser_context=self.browser_context)
+            need_login = not await self._wait_for_login_readiness()
             if need_login:
                 # Account management owns login; background jobs never reopen a
                 # different browser or silently switch to an interactive login.
@@ -183,9 +150,10 @@ class DouYinCrawler(AbstractCrawler):
 
     @asynccontextmanager
     async def _browser_lifetime(self):
-        async with async_playwright() as playwright:
+        from tools.account_display import account_display
+        with account_display():
             try:
-                yield playwright
+                yield None  # The Camoufox manager owns the sole driver/browser.
             except BaseException:
                 try:
                     await self._close_current_browser()
@@ -223,14 +191,17 @@ class DouYinCrawler(AbstractCrawler):
         use_background_mode: bool,
         background_headless: bool,
     ) -> None:
-        if os.getenv("MEDIACRAWLER_DY_BROWSER_ENGINE", "cloakbrowser") != "cloakbrowser":
-            raise ValueError("Douyin requires CloakBrowser; legacy browser fallback is disabled")
-        from tools.cloak_browser import launch_account_context
-        root = Path(os.getenv("MEDIACRAWLER_CLOAK_PROFILE_ROOT", config.DY_CLOAK_PROFILE_ROOT))
-        self.browser_context, self._cloak_profile = await launch_account_context(
+        if os.getenv("MEDIACRAWLER_DY_BROWSER_ENGINE", "camoufox") != "camoufox":
+            raise ValueError("Douyin requires Camoufox; legacy browser fallback is disabled")
+        from tools.camoufox_browser import launch_account_context
+        root = Path(os.getenv("MEDIACRAWLER_CAMOUFOX_PROFILE_ROOT", config.DY_CAMOUFOX_PROFILE_ROOT))
+        self.browser_context, self._camoufox_profile = await launch_account_context(
             os.getenv("MEDIACRAWLER_ACCOUNT_ID", ""), root,
-            headless=bool(config.HEADLESS) if self._headless_was_explicitly_set() else True,
+            headless=sys.platform == "darwin",
             proxy=playwright_proxy,
+            **({'route_snapshot': self._bound_proxy_session.snapshot,
+                'bound_proxy_session': self._bound_proxy_session}
+               if self._bound_proxy_session is not None else {}),
         )
 
     # Chromium network-layer failures that a fresh attempt normally clears
@@ -265,9 +236,20 @@ class DouYinCrawler(AbstractCrawler):
         attempt = 0
         while True:
             try:
-                await self.context_page.goto(self.index_url)
+                if self._bound_proxy_session is not None:
+                    async with self._bound_proxy_session.slot('navigate', timeout=self.INDEX_NAVIGATION_TIMEOUT_SECONDS + 5):
+                        await self.context_page.goto(self.index_url, wait_until='domcontentloaded',
+                            timeout=self.INDEX_NAVIGATION_TIMEOUT_SECONDS * 1000)
+                else:
+                    await self.context_page.goto(self.index_url, wait_until='domcontentloaded',
+                        timeout=self.INDEX_NAVIGATION_TIMEOUT_SECONDS * 1000)
                 return
+            except PlaywrightTimeoutError:
+                # A slow document is not proof that the fixed proxy is dead.
+                raise RuntimeError('PAGE_INITIALIZATION_TIMEOUT') from None
             except PlaywrightError as exc:
+                if self._bound_proxy_session is not None:
+                    raise self._bound_proxy_session.fail('PROXY_UNAVAILABLE') from None
                 if attempt >= retries or not self._is_transient_page_load_error(exc):
                     raise
                 attempt += 1
@@ -276,6 +258,33 @@ class DouYinCrawler(AbstractCrawler):
                     f"{str(exc).splitlines()[0][:160]}"
                 )
                 await asyncio.sleep(backoff * attempt)
+
+    async def _wait_for_login_readiness(self) -> bool:
+        """Wait independently for a ready first-party document and existing auth.
+
+        Platform risk/route errors propagate; only an unready login is polled.
+        Background resources need not finish and no second browser is opened.
+        """
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.LOGIN_READINESS_TIMEOUT_SECONDS
+        async with asyncio.timeout(self.LOGIN_READINESS_TIMEOUT_SECONDS + 5):
+            while True:
+                if self._bound_proxy_session is not None:
+                    await self._bound_proxy_session.check_stop_async()
+                ready = await asyncio.wait_for(self.context_page.evaluate("""() => {
+                    const host = location.hostname;
+                    return location.protocol === 'https:' &&
+                        (host === 'douyin.com' || host.endsWith('.douyin.com')) &&
+                        document.readyState !== 'loading';
+                }"""), 5)
+                if ready and await asyncio.wait_for(
+                    self.dy_client.pong(browser_context=self.browser_context), 5
+                ):
+                    return True
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    return False
+                await asyncio.sleep(min(.5, remaining))
 
     async def _close_current_browser(self) -> None:
         if self.cdp_manager:
@@ -292,7 +301,12 @@ class DouYinCrawler(AbstractCrawler):
         dy_limit_count = max(1, int(getattr(config, "DY_SEARCH_PAGE_SIZE", 15)))
         skip_aweme_ids: set[str] = set()
         skip_file = str(getattr(config, "DY_SKIP_AWEME_IDS_FILE", "") or "").strip()
-        if skip_file:
+        authority = getattr(self._bound_proxy_session, 'authority', None)
+        managed = bool(getattr(getattr(self._bound_proxy_session, 'snapshot', None), 'managed', False)
+                       or os.getenv('MEDIACRAWLER_MANAGED_ROUTE') == '1')
+        if managed and authority is None:
+            raise RuntimeError('PROXY_CONFIG_INVALID')
+        if skip_file and not managed:
             try:
                 skip_aweme_ids = {
                     line.strip() for line in Path(skip_file).read_text(encoding="utf-8").splitlines()
@@ -303,7 +317,7 @@ class DouYinCrawler(AbstractCrawler):
                 utils.logger.warning(f"[DouYinCrawler.search] cannot read reusable ID file: {exc}")
         reusable_db = str(getattr(config, "DY_REUSABLE_CONTENT_DB", "") or "").strip()
         reusable_conn = None
-        if reusable_db:
+        if reusable_db and not managed:
             try:
                 reusable_conn = sqlite3.connect(reusable_db)
             except sqlite3.Error as exc:
@@ -326,7 +340,9 @@ class DouYinCrawler(AbstractCrawler):
             utils.logger.info(f"[DouYinCrawler.search] Current keyword: {keyword}")
             current_task_ids: set[str] = set()
             current_task_id = str(getattr(config, "CURRENT_TASK_ID", "") or "").strip()
-            if reusable_conn and current_task_id:
+            if authority is not None:
+                current_task_ids.update(await self._owner_reusable_ids(keyword))
+            elif reusable_conn and current_task_id:
                 try:
                     rows = reusable_conn.execute(
                         "SELECT c.content_key, c.raw_item_path "
@@ -413,7 +429,9 @@ class DouYinCrawler(AbstractCrawler):
                     seen_aweme_ids.add(aweme_id)
                     page_ids.append(aweme_id)
                 new_unique_count = len(page_ids)
-                if reusable_conn and page_ids:
+                if authority is not None and page_ids:
+                    skip_aweme_ids.update(await self._owner_reusable_ids(keyword, ids=page_ids))
+                elif reusable_conn and page_ids:
                     placeholders = ",".join("?" for _ in page_ids)
                     try:
                         rows = reusable_conn.execute(
@@ -445,11 +463,13 @@ class DouYinCrawler(AbstractCrawler):
                         await self.get_aweme_media(aweme_item=aweme_info)
                         await self.batch_get_note_comments([aweme_id])
                         await self._enrich_author_profile(aweme_info)
+                        await self._attach_route_provenance(aweme_info)
                         await douyin_store.update_douyin_aweme(aweme_item=aweme_info)
                     else:
                         page_aweme_list.append(aweme_info.get("aweme_id", ""))
                         await self.get_aweme_media(aweme_item=aweme_info)
                         await self._enrich_author_profile(aweme_info)
+                        await self._attach_route_provenance(aweme_info)
                         await douyin_store.update_douyin_aweme(aweme_item=aweme_info)
                 
                 # Batch get note comments for the current page
@@ -475,6 +495,35 @@ class DouYinCrawler(AbstractCrawler):
                     )
         if reusable_conn:
             reusable_conn.close()
+
+    async def _owner_reusable_ids(self, keyword, *, ids=None):
+        """The App owner resolves cache DB/files; a child sends bounded IDs only."""
+        authority = getattr(self._bound_proxy_session, 'authority', None)
+        if authority is None:
+            raise RuntimeError('PROXY_CONFIG_INVALID')
+        found = set()
+        batches = ([ids[start:start + 100] for start in range(0, len(ids), 100)]
+                   if ids is not None else [None])
+        for batch in batches:
+            offset = 0
+            while True:
+                payload = ({'keyword': keyword, 'ids': batch} if batch is not None
+                           else {'keyword': keyword, 'offset': offset, 'limit': 128})
+                value = await authority.acall('cache_lookup', payload)
+                if (not isinstance(value, dict) or set(value) != {'ids', 'next_offset'} or
+                        not isinstance(value['ids'], list) or
+                        any(not isinstance(item, str) or not item or len(item) > 128 for item in value['ids'])):
+                    raise RuntimeError('PROXY_CONFIG_INVALID')
+                if batch is not None and not set(value['ids']) <= set(batch):
+                    raise RuntimeError('PROXY_CONFIG_INVALID')
+                found.update(value['ids'])
+                next_offset = value['next_offset']
+                if next_offset is None:
+                    break
+                if batch is not None or type(next_offset) is not int or not offset < next_offset <= 1000000:
+                    raise RuntimeError('PROXY_CONFIG_INVALID')
+                offset = next_offset
+        return found
 
     async def _enrich_author_profile(self, aweme_info: Dict) -> None:
         """Fill a search result's slimmed author from the user profile API.
@@ -521,6 +570,8 @@ class DouYinCrawler(AbstractCrawler):
                 )
                 cache[sec_uid] = {}
                 return
+            except CollectionRouteError:
+                raise
             except Exception as ex:
                 utils.logger.warning(
                     f"[DouYinCrawler.search] author profile fetch failed for {sec_uid}: {ex}"
@@ -593,6 +644,7 @@ class DouYinCrawler(AbstractCrawler):
             raise
         for aweme_detail in aweme_details:
             if aweme_detail is not None:
+                await self._attach_route_provenance(aweme_detail)
                 await douyin_store.update_douyin_aweme(aweme_item=aweme_detail)
                 await self.get_aweme_media(aweme_item=aweme_detail)
         await self.batch_get_note_comments(aweme_id_list)
@@ -746,6 +798,7 @@ class DouYinCrawler(AbstractCrawler):
         for post_item in video_list:
             aweme_item = await self.get_aweme_detail(post_item.get("aweme_id"), semaphore)
             await self.get_aweme_media(aweme_item=aweme_item)
+            await self._attach_route_provenance(aweme_item)
             await douyin_store.update_douyin_aweme(aweme_item=aweme_item)
 
     async def process_creator_aweme_stream_item(self, post_item: Dict, semaphore: asyncio.Semaphore) -> None:
@@ -757,7 +810,18 @@ class DouYinCrawler(AbstractCrawler):
         aweme_item = await self.get_aweme_detail(aweme_id, semaphore)
         await self.get_aweme_media(aweme_item=aweme_item)
         await self.batch_get_note_comments([aweme_id])
+        await self._attach_route_provenance(aweme_item)
         await douyin_store.update_douyin_aweme(aweme_item=aweme_item)
+
+    async def _attach_route_provenance(self, item):
+        session = self._bound_proxy_session
+        if session is not None and isinstance(item, dict):
+            from uuid import uuid4
+            item['collection_route_provenance'] = await session.provenance_async(
+                observation_id=uuid4().hex,
+                source_task_id=os.getenv('MEDIACRAWLER_SOURCE_TASK_ID', 'standalone'),
+                source_batch_id=os.getenv('MEDIACRAWLER_SOURCE_BATCH_ID', 'standalone'),
+            )
 
     async def create_douyin_client(self, httpx_proxy: Optional[str]) -> DouYinClient:
         """Create douyin client"""
@@ -778,6 +842,8 @@ class DouYinCrawler(AbstractCrawler):
             playwright_page=self.context_page,
             cookie_dict=cookie_dict,
             proxy_ip_pool=self.ip_proxy_pool,  # Pass proxy pool for automatic refresh
+            **({'bound_proxy_session': self._bound_proxy_session}
+               if self._bound_proxy_session is not None else {}),
         )
         return douyin_client
 
@@ -788,59 +854,16 @@ class DouYinCrawler(AbstractCrawler):
         user_agent: Optional[str],
         headless: bool = True,
     ) -> BrowserContext:
-        """Launch browser and create browser context"""
-        if config.SAVE_LOGIN_STATE:
-            user_data_dir = os.path.join(os.getcwd(), "browser_data", config.USER_DATA_DIR % config.PLATFORM)  # type: ignore
-            browser_context = await chromium.launch_persistent_context(
-                user_data_dir=user_data_dir,
-                accept_downloads=True,
-                headless=headless,
-                proxy=playwright_proxy,  # type: ignore
-                viewport={
-                    "width": 1920,
-                    "height": 1080
-                },
-                user_agent=user_agent,
-            )  # type: ignore
-            return browser_context
-        else:
-            browser = await chromium.launch(headless=headless, proxy=playwright_proxy)  # type: ignore
-            browser_context = await browser.new_context(viewport={"width": 1920, "height": 1080}, user_agent=user_agent)
-            return browser_context
+        raise RuntimeError("Douyin requires the account-bound Camoufox launcher; legacy browser fallback is disabled")
 
     async def launch_browser_with_cdp(
         self,
         playwright: Playwright,
         playwright_proxy: Optional[Dict],
         user_agent: Optional[str],
-        headless: bool = True,
+        headless: bool = False,
     ) -> BrowserContext:
-        """
-        使用CDP模式启动浏览器
-        """
-        try:
-            self.cdp_manager = CDPBrowserManager()
-            browser_context = await self.cdp_manager.launch_and_connect(
-                playwright=playwright,
-                playwright_proxy=playwright_proxy,
-                user_agent=user_agent,
-                headless=headless,
-            )
-
-            # Add anti-detection script
-            await self.cdp_manager.add_stealth_script()
-
-            # Show browser information
-            browser_info = await self.cdp_manager.get_browser_info()
-            utils.logger.info(f"[DouYinCrawler] CDP浏览器信息: {browser_info}")
-
-            return browser_context
-
-        except Exception as e:
-            utils.logger.error(f"[DouYinCrawler] CDP模式启动失败，回退到标准模式: {e}")
-            # Fall back to standard mode
-            chromium = playwright.chromium
-            return await self.launch_browser(chromium, playwright_proxy, user_agent, headless)
+        raise RuntimeError("Douyin requires the account-bound Camoufox launcher; CDP fallback is disabled")
 
     async def close(self) -> None:
         """Close browser context"""
