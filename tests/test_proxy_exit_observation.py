@@ -262,29 +262,27 @@ async def test_maintenance_probes_stopped_resource_without_authorizing_business(
 
 
 @pytest.mark.asyncio
-async def test_probe_pending_marker_precedes_context_page_event_and_cdp_blocker(tmp_path):
+async def test_probe_pending_marker_precedes_context_page_event_without_cdp(tmp_path):
     value,context,_=session(tmp_path)
-    events=[]
-    class CDP:
-        async def send(self,name,params=None):
-            events.append((name,params))
-        async def detach(self):
-            assert context.pages[-1].closed
-            events.append(('detached',None))
     async def new_page():
         assert context._collection_proxy_probe_pending is True
         return await FakeContext.new_page(context)
     context.new_page=new_page
-    async def new_cdp(page):
-        assert page._collection_proxy_probe is True
-        return CDP()
-    context.new_cdp_session=new_cdp
+    async def unsupported_cdp(page):
+        raise AssertionError('Firefox shared API is not a CDP capability')
+    context.new_cdp_session=unsupported_cdp
     try:
         await value.open_context(context)
         assert context._collection_proxy_probe_pending is False
-        assert events[0]==('Network.enable',None)
-        assert events[1]==('Network.setBlockedURLs',{'urls':['https://echo.invalid/favicon.ico']})
-        assert events.count(('detached',None))==2
+        assert len(context.pages)==2 and all(page.closed for page in context.pages)
+        from types import SimpleNamespace
+        from unittest.mock import AsyncMock
+        request=SimpleNamespace(url='https://echo.invalid/favicon.ico',method='GET',redirected_from=None)
+        route=SimpleNamespace(request=request,abort=AsyncMock(),continue_=AsyncMock())
+        # The exact page guard replaces the Chromium-only favicon blocker.
+        await context.route_handlers[-1](route)
+        route.abort.assert_awaited_once()
+        route.continue_.assert_not_awaited()
     finally:
         await value.close()
 
@@ -465,3 +463,148 @@ async def test_only_explicit_trial_login_session_reallocates_open_budget(tmp_pat
         assert value.budget.snapshot()['opens'] == 11
     finally:
         await value.close()
+
+
+@pytest.mark.asyncio
+async def test_firefox_shared_api_method_does_not_trigger_chromium_cdp(tmp_path):
+    value, context, _ = session(tmp_path)
+    async def unsupported(*args, **kwargs):
+        raise AssertionError('Firefox must not call Chromium CDP')
+    context.new_cdp_session = unsupported
+    value.context = context
+    assert await value._browser_sample() == context.ip
+    assert context.urls == ['https://echo.invalid/ip']
+    assert context.pages[0].closed
+
+
+@pytest.mark.asyncio
+async def test_camoufox_echo_requires_native_credential_filter_and_never_overrides_headers(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    value, context, _ = session(tmp_path)
+    value.context = context
+    monkeypatch.setenv('MEDIACRAWLER_DY_BROWSER_ENGINE','camoufox')
+    with pytest.raises(CollectionRouteError, match='PROXY_UNAVAILABLE'):
+        await value._browser_sample()
+    assert context.urls == []
+    context._navigation_policy_guard_ready = True
+    context._collection_native_echo_guard_url = value.echo_url
+    request=SimpleNamespace(headers={'Cookie':'canary','Authorization':'secret','Accept':'text/plain'})
+    route=SimpleNamespace(request=request,continue_=AsyncMock())
+    await value._continue_echo(route)
+    route.continue_.assert_awaited_once_with()
+    assert await value._browser_sample()==context.ip
+
+
+@pytest.mark.asyncio
+async def test_authority_loss_closes_context_without_cancelling_its_own_cleanup(tmp_path):
+    value, context, _ = session(tmp_path)
+    physically_closed=[]
+    async def wrapped_context_close():
+        # The account launcher wraps close with BoundProxySession.close first.
+        await value.close()
+        physically_closed.append(True)
+    context.close=wrapped_context_close
+    value.context=context
+    value._authority_lost()
+    tasks=list(value._background_tasks)
+    assert len(tasks)==1
+    await asyncio.wait_for(asyncio.gather(*tasks),1)
+    assert physically_closed==[True]
+    assert value._browser_closed and value._stopped=='PROXY_UNAVAILABLE'
+
+
+@pytest.mark.asyncio
+async def test_rendering_validation_coalesces_only_overlapping_calls_without_cached_pause(tmp_path):
+    value, context, _ = session(tmp_path)
+    calls=[];paused=[False]
+    class Authority:
+        async def acall(self, operation, payload=None):
+            assert operation=='browser_validate'
+            calls.append(operation)
+            await asyncio.sleep(.01)
+            if paused[0]:
+                raise CollectionRouteError('PROXY_UNAVAILABLE')
+    value.authority=Authority()
+    await asyncio.gather(*(value._validate_browser_safety_async() for _ in range(400)))
+    assert len(calls)==1
+    paused[0]=True
+    results=await asyncio.gather(*(value._validate_browser_safety_async() for _ in range(10)),return_exceptions=True)
+    assert len(calls)==2 and all(isinstance(result,CollectionRouteError) for result in results)
+
+
+@pytest.mark.asyncio
+async def test_persisted_profile_reopen_requires_physical_close_and_keeps_probe_budget(tmp_path):
+    value,context,_=session(tmp_path)
+    await value.open_context(context)
+    before=value.budget.snapshot()['used']
+    await value.close()
+    with pytest.raises(CollectionRouteError):
+        await value.reopen_after_context_closed()
+    await context.close()
+    assert value.confirm_context_closed(context)
+    await value.reopen_after_context_closed()
+    second=FakeContext(context.ip)
+    try:
+        await value.open_context(second)
+        assert value.budget.snapshot()['used']==before+2
+        assert value.guard.calls_used==before+2
+    finally:
+        await value.close()
+        await second.close()
+
+
+def test_direct_transport_health_is_scoped_to_exact_exit_generation_or_unobserved_operation(tmp_path):
+    from dataclasses import replace
+    from tools.bound_proxy import route_health_key
+    first=replace(snapshot(tmp_path),route_mode='legacy_direct',proxy_id='service-direct',observed_exit_ip='203.0.113.1',exit_generation=1)
+    same_exit_other_generation=replace(first,exit_generation=2)
+    other_exit=replace(first,observed_exit_ip='203.0.113.2')
+    unknown=replace(first,observed_exit_ip=None)
+    assert len({route_health_key(first),route_health_key(same_exit_other_generation),route_health_key(other_exit)})==3
+    assert route_health_key(unknown,operation_identity='operation-one')!=route_health_key(unknown,operation_identity='operation-two')
+    assert all(route_health_key(value)!='service-direct' for value in (first,same_exit_other_generation,other_exit))
+
+
+@pytest.mark.asyncio
+async def test_cancelled_rendering_wave_cannot_reuse_completed_authority_decision(tmp_path):
+    value,context,_=session(tmp_path)
+    started=asyncio.Event();finish=asyncio.Event();calls=[];paused=[False]
+    class Authority:
+        async def acall(self,operation,payload=None):
+            calls.append(operation)
+            if len(calls)==1:
+                started.set()
+                await finish.wait()
+            if paused[0]:
+                raise CollectionRouteError('PROXY_UNAVAILABLE')
+    value.authority=Authority()
+    waiter=asyncio.create_task(value._validate_browser_safety_async())
+    await started.wait()
+    waiter.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiter
+    inflight=value._browser_validation_task
+    finish.set()
+    await inflight
+    paused[0]=True
+    with pytest.raises(CollectionRouteError):
+        await value._validate_browser_safety_async()
+    assert len(calls)==2
+
+
+@pytest.mark.parametrize('reason',['DOCUMENT_GUARD_TIMEOUT','DOCUMENT_GUARD_FAILED'])
+def test_firefox_document_guard_first_reason_is_emitted_on_existing_receipt_pipe(tmp_path,monkeypatch,reason):
+    import os
+    from dataclasses import replace
+    from tools.bound_proxy import emit_browser_guard_stopped
+    snap=replace(snapshot(tmp_path),operation_id='operation',lease_id='lease',lease_version=1,
+        owner_id='owner',snapshot_digest='a'*64,context_id='context')
+    read_fd,write_fd=os.pipe()
+    monkeypatch.setenv('MEDIACRAWLER_PROXY_RECEIPT_FD',str(write_fd))
+    try:
+        assert emit_browser_guard_stopped(snap,reason)
+        value=json.loads(os.read(read_fd,4096))
+        assert value['type']=='browser_guard_stopped' and value['reason']==reason
+    finally:
+        os.close(read_fd);os.close(write_fd)

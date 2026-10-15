@@ -93,7 +93,8 @@ def emit_account_risk(snapshot):
 BROWSER_GUARD_REASONS = frozenset({'BOUND_REQUEST_GUARD','BOUND_RUNTIME_GUARD','BOUND_DATABASE_GUARD',
     'SHARED_ADMISSION_GUARD','SHARED_COOLDOWN_GUARD','SHARED_REQUEST_LIMIT','SHARED_ACTIVE_LIMIT',
     'PAGE_REQUEST_LIMIT','PAGE_ROLLING_LIMIT','PAGE_LIFETIME_LIMIT','PAGE_BYTE_LIMIT','PAGE_SIZES_FAILED',
-    'CDP_GUARD_TIMEOUT','CDP_GUARD_FAILED','PERIODIC_PROBE_GUARD','BROWSER_QUEUE_LIMIT'})
+    'CDP_GUARD_TIMEOUT','CDP_GUARD_FAILED','DOCUMENT_GUARD_TIMEOUT','DOCUMENT_GUARD_FAILED',
+    'PERIODIC_PROBE_GUARD','BROWSER_QUEUE_LIMIT'})
 
 
 def emit_browser_guard_stopped(snapshot, reason):
@@ -148,6 +149,8 @@ class SharedProbeBudget:
     Failed attempts spend reserved budget. No clear/refund operation exists.
     """
     def __init__(self, db_path, budget_id, *, max_calls=96):
+        from tools.authority_ledger import deny_worker_database
+        deny_worker_database()
         if not isinstance(budget_id, str) or not budget_id or len(budget_id) > 128 or any(c not in 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-' for c in budget_id):
             _error()
         if type(max_calls) is not int or max_calls < 4 or max_calls > 96:
@@ -260,13 +263,29 @@ def obtain_route_ack(snapshot, *, env=None, timeout=5.0, previous_ack=None):
         _error('PROXY_REVISION_MISMATCH')
 
 
+def route_health_key(snapshot, *, operation_identity=''):
+    if snapshot.route_mode in {'direct_degraded','legacy_direct'}:
+        if snapshot.observed_exit_ip:
+            return 'service-direct.'+hashlib.sha256(snapshot.observed_exit_ip.encode()).hexdigest()[:32]+'.'+str(snapshot.exit_generation)
+        identity = snapshot.operation_id or operation_identity
+        if not identity:
+            _error('PROXY_CONFIG_INVALID')
+        return 'service-unobserved.'+hashlib.sha256(identity.encode()).hexdigest()[:32]
+    return snapshot.proxy_id
+
+
 class BoundProxySession:
     """A frozen route with one live browser context and a validated receipt."""
     def __init__(self, snapshot, *, echo_url=None, budget_id=None, stop_checker=None,
                  ttl=None, max_calls=None, verify=True, http_client_factory=None,
                  policy=None, maintenance_only=False, trial_id=None, reuse_existing_policy=False,
-                 account_policy=None, login_bootstrap=False, ack=None, lease_renewer=None):
+                 account_policy=None, login_bootstrap=False, ack=None, lease_renewer=None, authority_owner=False):
         self.snapshot = snapshot
+        self.authority = None
+        if not authority_owner and (os.getenv('MEDIACRAWLER_DY_BROWSER_ENGINE') == 'camoufox'
+                or os.getenv('MEDIACRAWLER_REQUEST_AUTHORITY_FD')):
+            from tools.request_authority import AuthorityClient
+            self.authority = AuthorityClient(snapshot)
         # Managed routes are unusable until the App's redacted ACK has been
         # validated.  This fail-closed check also prevents callers from
         # falling through to an unmanaged automatic proxy pool.
@@ -275,6 +294,8 @@ class BoundProxySession:
         self._lease_ack = self.snapshot.require_managed_ack(ack, lease_version=ack.get('lease_version')) if ack is not None else obtain_route_ack(snapshot)
         self._lease_renewer = lease_renewer
         self._lease_lock = threading.RLock()
+        if self.authority:
+            self.authority.call('initialize')
         if trial_id is not None and not isinstance(trial_id, str):
             _error()
         self._trial_id = trial_id
@@ -297,8 +318,14 @@ class BoundProxySession:
             _error()
         if not math.isfinite(ttl) or not 0 < ttl <= 300 or verify is False:
             _error()
+        self._budget_identity = budget_id or os.getenv('MEDIACRAWLER_PROXY_PROBE_BUDGET_ID', '')
+        self._health_operation_identity = snapshot.operation_id or uuid4().hex
         self.guard = ProbeGuard(snapshot, max_calls=max_calls, ttl=ttl)
-        self.budget = SharedProbeBudget(snapshot.scheduler_db_path, budget_id or os.getenv('MEDIACRAWLER_PROXY_PROBE_BUDGET_ID', ''), max_calls=max_calls)
+        if self.authority:
+            from tools.request_authority import RemoteBudget
+            self.budget = RemoteBudget(self.authority)
+        else:
+            self.budget = SharedProbeBudget(snapshot.scheduler_db_path, budget_id or os.getenv('MEDIACRAWLER_PROXY_PROBE_BUDGET_ID', ''), max_calls=max_calls)
         self.stop_checker = stop_checker
         self.verify = verify
         self._http_client_factory = http_client_factory or httpx.AsyncClient
@@ -320,11 +347,92 @@ class BoundProxySession:
         self._gate = None
         self._background_tasks = set()
         self._browser_closed = False
+        self._opened_context = None
+        self._physical_context_closed = False
         self._echo_context_handler = None
         self._receipt_delivered = False
+        self._browser_validation_task = None
         self.trial_limits = None
+        if self.authority:
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = None
+            def lost_authority():
+                self._stopped = 'PROXY_UNAVAILABLE'
+                if loop is not None and not loop.is_closed():
+                    loop.call_soon_threadsafe(self._authority_lost)
+            self.authority.on_disconnect = lost_authority
+
+    def _accept_authority_ticket(self, result):
+        if not self.snapshot.managed:
+            return
+        if not isinstance(result, dict) or set(result) != {'ack'} or not isinstance(result['ack'], dict):
+            _error('PROXY_REVISION_MISMATCH')
+        ack = result['ack']
+        version = ack.get('lease_version')
+        with self._lease_lock:
+            previous = self._lease_ack
+            if type(version) is not int or version < previous['lease_version']:
+                _error('PROXY_REVISION_MISMATCH')
+            checked = self.snapshot.require_managed_ack(ack, lease_version=version)
+            if version == previous['lease_version'] and checked['expires_at'] != previous['expires_at']:
+                _error('PROXY_REVISION_MISMATCH')
+            if version > previous['lease_version'] and checked['expires_at'] <= previous['expires_at']:
+                _error('PROXY_REVISION_MISMATCH')
+            self._lease_ack = checked
+
+    def _next_probe_delay(self):
+        pause = self.guard.ttl
+        if self.snapshot.managed:
+            pause = min(pause, max(1, self._lease_ack['expires_at']-time.time()-25))
+        return pause
+
+    async def check_stop_async(self):
+        if self.authority:
+            if self._stopped:
+                _error(self._stopped)
+            self.snapshot.require_not_expired(allow_unknown=True)
+            self._accept_authority_ticket(await self.authority.acall('check_stop'))
+            if self.stop_checker:
+                result = await asyncio.to_thread(self.stop_checker)
+                if result:
+                    _error(result if isinstance(result, str) else 'PROXY_UNAVAILABLE')
+        else:
+            self.check_stop()
+
+    async def _validate_browser_safety_async(self):
+        if self.authority:
+            if self._browser_closed:
+                _error('PROXY_UNAVAILABLE')
+            task = self._browser_validation_task
+            if task is not None and task.done():
+                self._browser_validation_task = None
+                task = None
+            if task is None:
+                task = asyncio.create_task(self.authority.acall('browser_validate'))
+                self._browser_validation_task = task
+            try:
+                # Coalesce only overlapping validations. No decision is cached
+                # after completion, so the next wave reads current pause state.
+                await asyncio.shield(task)
+            finally:
+                if task.done() and self._browser_validation_task is task:
+                    self._browser_validation_task = None
+        else:
+            self._validate_browser_safety()
 
     def check_stop(self):
+        if self.authority:
+            if self._stopped:
+                _error(self._stopped)
+            self.snapshot.require_not_expired(allow_unknown=True)
+            self._accept_authority_ticket(self.authority.call('check_stop'))
+            if self.stop_checker:
+                result = self.stop_checker()
+                if result:
+                    _error(result if isinstance(result, str) else 'PROXY_UNAVAILABLE')
+            return
         if self.snapshot.managed:
             with self._lease_lock:
                 if self._lease_ack['expires_at'] <= time.time() and not self._lease_renewer:
@@ -366,13 +474,21 @@ class BoundProxySession:
                 pass
 
     def _health_key(self):
-        if self.snapshot.route_mode=='direct_degraded':
-            return 'service-direct.'+hashlib.sha256(self.snapshot.observed_exit_ip.encode()).hexdigest()[:32]+'.'+str(self.snapshot.exit_generation)
+        if self.snapshot.route_mode in {'direct_degraded','legacy_direct'}:
+            return route_health_key(self.snapshot, operation_identity=self._health_operation_identity)
         return self.snapshot.proxy_id
 
     def fail(self, code):
         error = CollectionRouteError(code)
         self._stopped = error.code
+        if self.authority:
+            try:
+                self.authority.call('fail', dict(code=error.code))
+            except CollectionRouteError:
+                pass
+            if error.code in {'PROXY_AUTH_FAILED','PROXY_CONNECTION_REFUSED','PROXY_TRANSPORT_FAILED','PROXY_EXPIRED','PROXY_EXIT_CHANGED'}:
+                self._event(error.code)
+            return error
         transport=error.code in {'PROXY_AUTH_FAILED','PROXY_CONNECTION_REFUSED','PROXY_TRANSPORT_FAILED','PROXY_EXPIRED','PROXY_EXIT_CHANGED'}
         if transport or (not self.snapshot.managed and not self.maintenance_only):
             try:
@@ -385,15 +501,23 @@ class BoundProxySession:
         return error
 
     async def open_context(self, context, context_id=None, on_probe_page=None):
-        self.check_stop()
+        await self.check_stop_async()
         if self.context is not None:
             _error()
+        if self.authority:
+            loop = asyncio.get_running_loop()
+            def lost_authority():
+                self._stopped = 'PROXY_UNAVAILABLE'
+                if not loop.is_closed():
+                    loop.call_soon_threadsafe(self._authority_lost)
+            self.authority.on_disconnect = lost_authority
         self.context, self.context_id = context, self.snapshot.context_id if self.snapshot.managed else context_id or uuid4().hex
+        self._opened_context = context
+        self._physical_context_closed = False
         self._on_probe_page = on_probe_page
-        # Login V2 intentionally uses CDP document guards. Playwright routing
-        # disables Chromium's cache and can leave the login shell perpetually
-        # hydrating. The browser context is already pinned to this immutable
-        # proxy snapshot, while login navigation/actions use bound slots.
+        # Login document/resource filtering belongs to the verified Firefox
+        # policy. The proxy layer checks route safety without debiting page
+        # resources from the business-request budget.
         if callable(getattr(context, 'route', None)) and not self._login_bootstrap:
             # Chromium's implicit favicon request is context-level; page.route
             # alone does not intercept it. Keep an echo-origin-only deny guard.
@@ -409,22 +533,20 @@ class BoundProxySession:
                 if not is_probe and not request.url.startswith(echo_origin + '/'):
                     if self.snapshot.managed:
                         try:
-                            self._validate_browser_safety()
+                            await self._validate_browser_safety_async()
                         except (CollectionRouteError, RuntimeError, sqlite3.Error) as exc:
                             reason=getattr(self,'_reservation_stop_reason',None) or ('BOUND_REQUEST_GUARD' if isinstance(exc,CollectionRouteError) else 'BOUND_DATABASE_GUARD' if isinstance(exc,sqlite3.Error) else 'BOUND_RUNTIME_GUARD')
                             self.record_browser_guard_stop(reason)
                             await route.abort()
                             self._stop_background()
                             return
-                    # Preserve later business CDP/page guards and route handlers.
+                    # Preserve later document/page guards and route handlers.
                     await route.fallback()
                     return
                 if not is_probe or request.url != self.echo_url or request.method != 'GET' or request.redirected_from is not None:
                     await route.abort()
                     return
-                headers = {key: value for key, value in request.headers.items()
-                           if key.lower() not in ('cookie', 'authorization', 'proxy-authorization')}
-                await route.continue_(headers=headers)
+                await self._continue_echo(route)
             self._echo_context_handler = context_echo_only
             await context.route(self._echo_pattern, context_echo_only)
         try:
@@ -435,6 +557,29 @@ class BoundProxySession:
         if not self.maintenance_only:
             self._periodic_task = asyncio.create_task(self._periodic_probe())
         return self.receipt
+
+    def confirm_context_closed(self, context):
+        """Launcher calls only after physical context and driver teardown."""
+        if self._opened_context is None:
+            return False
+        if context is not self._opened_context or not self._browser_closed or self.context is not None:
+            _error('PROXY_UNAVAILABLE')
+        self._physical_context_closed = True
+        return True
+
+    async def reopen_after_context_closed(self):
+        """Reuse one operation/channel for an explicit persisted-profile check."""
+        if (not self._physical_context_closed or not self._browser_closed or self.context is not None
+                or self._periodic_task is not None or any(not task.done() for task in self._background_tasks)):
+            _error('PROXY_UNAVAILABLE')
+        await self.check_stop_async()
+        self._opened_context = None
+        self._physical_context_closed = False
+        self._browser_closed = False
+        self.receipt = None
+        self._gate = None
+        self._receipt_delivered = False
+        self._on_probe_page = None
 
     async def close(self):
         self._browser_closed=True
@@ -447,11 +592,13 @@ class BoundProxySession:
                 await task
             except asyncio.CancelledError:
                 pass
-        for background_task in list(self._background_tasks):
+        current = asyncio.current_task()
+        closing_tasks = [task for task in self._background_tasks if task is not current]
+        for background_task in closing_tasks:
             background_task.cancel()
-        if self._background_tasks:
-            await asyncio.gather(*self._background_tasks, return_exceptions=True)
-        self._background_tasks.clear()
+        if closing_tasks:
+            await asyncio.gather(*closing_tasks, return_exceptions=True)
+        self._background_tasks.difference_update(closing_tasks)
         # Keep the echo-origin deny guard until the browser actually closes.
         # Removing it first lets a delayed browser favicon escape during teardown.
         self.context = None
@@ -467,6 +614,17 @@ class BoundProxySession:
             return
         self._browser_guard_first_reason=reason
         emit_browser_guard_stopped(self.snapshot,reason)
+
+    def _authority_lost(self):
+        self._stopped = 'PROXY_UNAVAILABLE'
+        if self.context is not None and not self._browser_closed:
+            self._spawn_background(self._close_for_authority_loss())
+
+    async def _close_for_authority_loss(self):
+        try:
+            await self.context.close()
+        finally:
+            self._browser_closed = True
 
     def _stop_background(self, reason=None):
         if reason is not None:self.record_browser_guard_stop(reason)
@@ -486,6 +644,11 @@ class BoundProxySession:
     def _validate_browser_safety(self):
         """Fence rendering traffic without consuming business request budgets."""
         self._reservation_stop_reason=None
+        if self.authority:
+            if self._browser_closed:
+                _error('PROXY_UNAVAILABLE')
+            self.authority.call('browser_validate')
+            return
         if self._browser_closed:
             _error('PROXY_UNAVAILABLE')
         self.check_stop()
@@ -517,10 +680,7 @@ class BoundProxySession:
     async def _periodic_probe(self):
         try:
             while True:
-                pause = self.guard.ttl
-                if self.snapshot.managed:
-                    pause = min(pause,max(1,self._lease_ack['expires_at']-time.time()-25))
-                await asyncio.sleep(pause)
+                await asyncio.sleep(self._next_probe_delay())
                 await self._probe('tick')
         except asyncio.CancelledError:
             raise
@@ -530,7 +690,28 @@ class BoundProxySession:
                 self.record_browser_guard_stop('PERIODIC_PROBE_GUARD')
                 await self.context.close()
 
+    def _native_echo_guard(self):
+        strict = self.authority is not None or os.getenv('MEDIACRAWLER_DY_BROWSER_ENGINE') == 'camoufox'
+        native = (getattr(self.context, '_navigation_policy_guard_ready', False) is True
+                  and getattr(self.context, '_collection_native_echo_guard_url', None) == self.echo_url)
+        if strict and not native:
+            _error('PROXY_UNAVAILABLE')
+        return native
+
+    async def _continue_echo(self, route):
+        if self._native_echo_guard():
+            # Firefox Juggler's header override suppresses native proxy auth.
+            # The verified extension strips origin credentials before send.
+            await route.continue_()
+        else:
+            # Test/standalone non-Camoufox contexts retain the old public API
+            # contract; no production Camoufox path may take this branch.
+            headers = {key: value for key, value in route.request.headers.items()
+                       if key.lower() not in ('cookie', 'authorization', 'proxy-authorization')}
+            await route.continue_(headers=headers)
+
     async def _browser_sample(self):
+        self._native_echo_guard()
         previous_pending = getattr(self.context, '_collection_proxy_probe_pending', False)
         self.context._collection_proxy_probe_pending = True
         try:
@@ -540,14 +721,10 @@ class BoundProxySession:
             raise CollectionRouteError('PROXY_UNAVAILABLE') from None
         finally:
             self.context._collection_proxy_probe_pending = previous_pending
-        cdp = None
         try:
-            if callable(getattr(self.context, 'new_cdp_session', None)):
-                cdp = await self.context.new_cdp_session(page)
-                await cdp.send('Network.enable')
-                parsed_echo = urlsplit(self.echo_url)
-                await cdp.send('Network.setBlockedURLs', {'urls': [
-                    parsed_echo.scheme + '://' + parsed_echo.netloc + '/favicon.ico']})
+            # Firefox exposes new_cdp_session on the shared Playwright API but
+            # cannot execute Chromium CDP. The exact page route below guards
+            # both echo traffic and implicit/favicon subresources.
             # Mark the page before any navigation so business document guards can
             # explicitly identify this page without widening business allowlists.
             page._collection_proxy_probe = True
@@ -562,15 +739,13 @@ class BoundProxySession:
                 if request.url != self.echo_url or request.method != 'GET' or request.redirected_from is not None:
                     await route.abort()
                     return
-                headers = {key: value for key, value in request.headers.items()
-                           if key.lower() not in ('cookie', 'authorization', 'proxy-authorization')}
-                await route.continue_(headers=headers)
+                await self._continue_echo(route)
             await page.route('**/*', echo_only)
-            # A real browser DOM fetch from about:blank avoids registering echo
-            # as a visited storage origin. Playwright storage_state internally
-            # navigates closed origins and otherwise triggers an unguarded favicon.
-            # Echo must explicitly allow CORS from null; no security bypass/API
-            # request context substitute is used.
+            # A real browser fetch from about:blank avoids registering echo as
+            # a visited storage origin. Exact native header filtering preserves
+            # Firefox proxy challenge auth; no Playwright header override is used.
+            # Echo explicitly allows CORS from null; no API transport substitute
+            # or browser security bypass is used.
             sample = await asyncio.wait_for(page.evaluate("""async url => {
                 const response = await fetch(url, {mode: 'cors', credentials: 'omit',
                     redirect: 'error', cache: 'no-store'});
@@ -606,11 +781,6 @@ class BoundProxySession:
                 await page.close()
             except Exception:
                 pass  # Outer context owner closes it; preserve safe probe error.
-            if cdp is not None:
-                try:
-                    await cdp.detach()
-                except Exception:
-                    pass  # Target is already closed; blocker remained until close.
 
     async def _http_sample(self):
         try:
@@ -634,15 +804,22 @@ class BoundProxySession:
         try:
             return await self._probe_locked(category)
         except CollectionRouteError as exc:
-            self.fail(exc.code)
+            if self.authority:
+                await asyncio.to_thread(self.fail, exc.code)
+            else:
+                self.fail(exc.code)
             raise
 
     async def _probe_locked(self, category):
         async with self._probe_lock:
-            self.check_stop()
+            await self.check_stop_async()
             if self.context is None:
                 _error('PROXY_UNAVAILABLE')
-            pairs = self.budget.reserve(category, use_remaining=self._login_bootstrap and category == 'open')
+            if self.authority:
+                pairs = await self.authority.acall('probe_reserve', dict(category=category,
+                    use_remaining=self._login_bootstrap and category == 'open'))
+            else:
+                pairs = self.budget.reserve(category, use_remaining=self._login_bootstrap and category == 'open')
             for _ in range(pairs):
                 # Shared budget is authority; per-process guard mirrors this usage.
                 self.guard.reserve_pair()
@@ -677,13 +854,16 @@ class BoundProxySession:
                     self._event(event_code, receipt)
                 else:
                     receipt = self.guard.confirm_pair(self.context_id, browser_ip, http_ip)
-                    self.budget.confirm_baseline(self.snapshot, receipt.ip)
+                    if self.authority:
+                        await self.authority.acall('probe_confirm', dict(ip=receipt.ip))
+                    else:
+                        self.budget.confirm_baseline(self.snapshot, receipt.ip)
                     self._event('ROUTE_OBSERVED', receipt)
                     self._receipt_delivered = emit_probe_receipt(self.snapshot, receipt)
                 self.receipt = receipt
             if not self.maintenance_only and self.snapshot.expires_at is not None:
-                self._gate = self._make_gate()
-                if self.trial_limits is None:
+                self._gate = await asyncio.to_thread(self._make_gate) if self.authority else self._make_gate()
+                if self.trial_limits is None and not self.authority:
                     from tools.trial_limits import from_env
                     try:
                         trial_env = None if self._trial_id is None else {
@@ -701,6 +881,13 @@ class BoundProxySession:
             operation_id=self.snapshot.operation_id, ttl=300, recovery_claim=self.snapshot.recovery_claim, owner_id=self.snapshot.owner_id)
 
     def _make_gate(self):
+        if self.authority:
+            from dataclasses import asdict
+            from tools.request_authority import RemoteGate, RemoteTrial
+            self.guard.require_business(self.receipt, self.context_id)
+            result = self.authority.call('make_gate', dict(receipt=asdict(self.receipt)))
+            self.trial_limits = RemoteTrial(self.authority) if result['trial_enabled'] else None
+            return RemoteGate(self.authority, stop_checker=self.check_stop_async)
         from tools.persistent_request_gate import RequestScheduler, MultiScopeGate, configured_gate
         if self._reuse_existing_policy:
             scopes = self.guard.require_business(self.receipt, self.context_id)
@@ -777,7 +964,7 @@ class BoundProxySession:
     async def ensure_business(self):
         if self.maintenance_only:
             _error('PROXY_UNAVAILABLE')
-        self.check_stop()
+        await self.check_stop_async()
         self.snapshot.require_not_expired()
         if self.receipt is None or self.context is None:
             _error('PROXY_UNAVAILABLE')
@@ -791,13 +978,17 @@ class BoundProxySession:
         gate = await self.ensure_business()
         try:
             async with gate.slot(operation, timeout=timeout, max_wait=max_wait) as waited:
-                self.check_stop()
+                await self.check_stop_async()
                 self.guard.require_business(self.receipt, self.context_id)
                 if self.trial_limits is not None:
                     try:
-                        self.trial_limits.reserve_operation()
+                        if self.authority:
+                            await self.authority.acall('trial_operation')
+                        else:
+                            self.trial_limits.reserve_operation()
                     except RuntimeError:
-                        raise self.fail('PROBE_BUDGET_EXHAUSTED') from None
+                        error = await asyncio.to_thread(self.fail, 'PROBE_BUDGET_EXHAUSTED') if self.authority else self.fail('PROBE_BUDGET_EXHAUSTED')
+                        raise error from None
                 yield waited
         except RuntimeError as exc:
             if str(exc)=='ACCOUNT_CHALLENGE':
@@ -816,6 +1007,15 @@ class BoundProxySession:
         if self.maintenance_only:
             _error('PROXY_UNAVAILABLE')
         self.check_stop()
+        return collection_route_provenance(self.snapshot, self.receipt, observation_id=observation_id,
+                                          source_task_id=source_task_id, source_batch_id=source_batch_id,
+                                          collected_at=time.time() if collected_at is None else collected_at,
+                                          context_id=self.context_id)
+
+    async def provenance_async(self, *, observation_id, source_task_id, source_batch_id, collected_at=None):
+        if self.maintenance_only:
+            _error('PROXY_UNAVAILABLE')
+        await self.check_stop_async()
         return collection_route_provenance(self.snapshot, self.receipt, observation_id=observation_id,
                                           source_task_id=source_task_id, source_batch_id=source_batch_id,
                                           collected_at=time.time() if collected_at is None else collected_at,

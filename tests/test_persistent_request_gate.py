@@ -107,6 +107,31 @@ def test_expired_lease_and_changed_policy_preserve_budget(tmp_path):
     assert state.snapshot()['request_count_last_minute']==2
 
 
+def test_scheduler_release_removes_only_its_lease_and_process_identity(tmp_path):
+    db = tmp_path / 'gate.sqlite3'
+    state = RequestScheduler(db, min_interval=0, per_minute=1000,
+                             media_interval=0, max_concurrency=2)
+    _, released, _ = state.try_acquire(lease_seconds=90)
+    _, retained, _ = state.try_acquire(lease_seconds=90)
+    assert released and retained and released != retained
+    with sqlite3.connect(db) as connection:
+        for table in ('request_scheduler_leases', 'crawler_authority_process_leases'):
+            assert {row[0] for row in connection.execute(f'SELECT token FROM {table}')} == {released, retained}
+
+    state.release(released)
+    state.release(released)  # Cleanup remains idempotent.
+    with sqlite3.connect(db) as connection:
+        for table in ('request_scheduler_leases', 'crawler_authority_process_leases'):
+            assert connection.execute(f'SELECT token FROM {table}').fetchall() == [(retained,)]
+    assert state.snapshot()['request_count_last_minute'] == 2
+    assert state.snapshot()['in_flight'] == 1
+
+    state.release(retained)
+    with sqlite3.connect(db) as connection:
+        for table in ('request_scheduler_leases', 'crawler_authority_process_leases'):
+            assert connection.execute(f'SELECT token FROM {table}').fetchall() == []
+
+
 def test_configuration_is_required_and_conflicts_fail_closed(tmp_path,monkeypatch):
     monkeypatch.delenv('MEDIACRAWLER_REQUEST_SCHEDULER_DB',raising=False)
     monkeypatch.delenv('MEDIACRAWLER_CLOAK_PROFILE_ROOT',raising=False)

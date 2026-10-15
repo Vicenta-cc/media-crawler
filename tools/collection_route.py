@@ -226,7 +226,7 @@ class BoundRoute:
     def business_scope_ids(self, receipt, context_id, now=None, ttl=300):
         self.require_not_expired(now)
         require_probe_receipt(self, receipt, context_id, now=now, ttl=ttl)
-        return self.scope_ids if self.route_mode == 'direct_degraded' else derive_scope_ids(self.platform, self.account_id, self.proxy_id, receipt.ip)
+        return self.scope_ids if self.route_mode in {'direct_degraded', 'legacy_direct'} else derive_scope_ids(self.platform, self.account_id, self.proxy_id, receipt.ip)
 
 
 RouteSnapshot = BoundRoute
@@ -258,13 +258,14 @@ def validate_route_envelope(envelope, *, account_id, platform="dy", profile_key=
     if envelope['profile_key'] != derived_profile or (profile_key is not None and profile_key != derived_profile):
         _invalid()
     proxy_id = _identity(envelope['proxy_id'])
-    binding_revision = _revision(envelope['binding_revision'])
+    binding_revision = (0 if envelope['route_mode'] == 'legacy_direct' and type(envelope['binding_revision']) is int and envelope['binding_revision'] == 0 else _revision(envelope['binding_revision']))
     config_revision = _revision(envelope['config_revision'])
     endpoint = envelope['endpoint']
-    if envelope['route_mode'] == 'direct_degraded':
-        if endpoint is not None:
+    if envelope['route_mode'] in {'direct_degraded', 'legacy_direct'}:
+        if endpoint is None:
+            endpoint = {'scheme': 'http', 'host': 'direct.invalid', 'port': 1}
+        elif envelope['route_mode'] == 'direct_degraded' or extra:
             _invalid()
-        endpoint = {'scheme': 'http', 'host': 'direct.invalid', 'port': 1}
     _exact(endpoint, {'scheme', 'host', 'port'})
     if endpoint['scheme'] != 'http' or type(endpoint['port']) is not int or not 1 <= endpoint['port'] <= 65535:
         _invalid()
@@ -276,8 +277,6 @@ def validate_route_envelope(envelope, *, account_id, platform="dy", profile_key=
     expires_at = _timestamp(envelope['expires_at'])
     managed = bool(extra)
     if envelope['route_mode'] in {'proxy_preferred', 'direct_degraded'} and not managed:
-        _invalid()
-    if managed and envelope['route_mode'] == 'legacy_direct':
         _invalid()
     if managed:
         for key in ('operation_id', 'lease_id', 'owner_id', 'context_id'):
@@ -299,15 +298,17 @@ def validate_route_envelope(envelope, *, account_id, platform="dy", profile_key=
         _exact(observed, {'ip', 'observed_at'})
         exit_ip = canonical_exit_ip(observed['ip'])
         exit_at = _timestamp(observed['observed_at'], nullable=False)
-    if envelope['route_mode'] == 'direct_degraded' and exit_ip is None:
+    if (envelope['route_mode'] == 'direct_degraded' or envelope['route_mode'] == 'legacy_direct' and managed) and exit_ip is None:
         _invalid()
     scheduler = envelope['scheduler']
     _exact(scheduler, {'db_path', 'scope_ids'})
     if not isinstance(scheduler['db_path'], str) or not os.path.isabs(scheduler['db_path']) or '\x00' in scheduler['db_path']:
         _invalid()
     scopes = derive_scope_ids(platform, account_id, proxy_id, exit_ip)
-    if envelope['route_mode'] == 'direct_degraded':
+    if envelope['route_mode'] in {'direct_degraded', 'legacy_direct'} and exit_ip is not None:
         scopes = tuple(sorted([platform, platform + ':account:' + account_id, platform + ':service_exit:' + exit_ip, platform + ':exit:' + exit_ip]))
+    if envelope['route_mode'] == 'legacy_direct' and not managed and scheduler['scope_ids'] == list(derive_scope_ids(platform, account_id, proxy_id, exit_ip)):
+        scopes = derive_scope_ids(platform, account_id, proxy_id, exit_ip)
     if not isinstance(scheduler['scope_ids'], list) or scheduler['scope_ids'] != list(scopes):
         _invalid()
     if type(envelope.get('login_bootstrap', False)) is not bool:
@@ -378,7 +379,7 @@ def serialize_route(snapshot):
                     account_id=snapshot.account_id, profile_key=snapshot.profile_key,
                     proxy_id=snapshot.proxy_id, binding_revision=snapshot.binding_revision,
                     config_revision=snapshot.config_revision,
-                    endpoint=None if snapshot.route_mode == 'direct_degraded' else dict(scheme='http', host=snapshot.host, port=snapshot.port),
+                    endpoint=None if snapshot.route_mode in {'direct_degraded', 'legacy_direct'} else dict(scheme='http', host=snapshot.host, port=snapshot.port),
                     credentials=dict(username=snapshot.username, password=snapshot.password),
                     expires_at=snapshot.expires_at, observed_exit=observed,
                     scheduler=dict(db_path=snapshot.scheduler_db_path, scope_ids=list(snapshot.scope_ids)))
@@ -542,7 +543,7 @@ class ProbeGuard:
         with self._lock:
             if self._baseline is None or receipt.ip != self._baseline:
                 raise CollectionRouteError('PROXY_EXIT_CHANGED')
-        return self.snapshot.scope_ids if self.snapshot.route_mode=='direct_degraded' else derive_scope_ids(self.snapshot.platform, self.snapshot.account_id, self.snapshot.proxy_id, receipt.ip)
+        return self.snapshot.scope_ids if self.snapshot.route_mode in {'direct_degraded','legacy_direct'} else derive_scope_ids(self.snapshot.platform, self.snapshot.account_id, self.snapshot.proxy_id, receipt.ip)
 
 
 def validate_collection_route_provenance(value):
@@ -564,9 +565,10 @@ def validate_collection_route_provenance(value):
     for name in ('observation_id', 'source_task_id', 'source_batch_id', 'source_account_id'):
         _identity(value[name])
     _timestamp(value['collected_at'], nullable=False)
-    if value['route_mode'] in MANAGED_ROUTE_MODES:
+    if value['route_mode'] in MANAGED_ROUTE_MODES or value['route_mode'] == 'legacy_direct' and extra:
         _identity(value['proxy_id'])
-        _revision(value['binding_revision'])
+        if not (value['route_mode'] == 'legacy_direct' and type(value['binding_revision']) is int and value['binding_revision'] == 0):
+            _revision(value['binding_revision'])
         _revision(value['config_revision'])
         canonical_exit_ip(value['observed_exit_ip'])
         _timestamp(value['observed_exit_at'], nullable=False)

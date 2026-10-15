@@ -18,6 +18,88 @@ from pathlib import Path
 from uuid import uuid4
 
 
+MEDIA_LEASE_SECONDS = 90
+MEDIA_HEARTBEAT_SECONDS = 15
+
+
+@asynccontextmanager
+async def renewable_media_lifetime(renew, stop_checker=None):
+    """Cancel the body on lost authority; let body cleanup finish before release."""
+    parent = asyncio.current_task()
+    cancelling = parent.cancelling()
+    injected_cancel = False
+    failure = []
+
+    async def heartbeat():
+        nonlocal injected_cancel
+        try:
+            while True:
+                await asyncio.sleep(MEDIA_HEARTBEAT_SECONDS)
+                if stop_checker is not None:
+                    result = stop_checker()
+                    if hasattr(result, '__await__'):
+                        await result
+                    elif result:
+                        raise RuntimeError('REQUEST_SCHEDULER_STOPPED')
+                await renew()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            # An external cancellation may already be closing the HTTP stream.
+            # A second cancel here would interrupt that cleanup.
+            if parent.cancelling() == cancelling:
+                failure.append(exc)
+                injected_cancel = parent.cancel()
+
+    task = asyncio.create_task(heartbeat())
+    try:
+        try:
+            yield
+        except asyncio.CancelledError:
+            if injected_cancel:
+                injected_cancel = False
+                if parent.uncancel() <= cancelling:
+                    raise failure[0]
+            raise
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        if injected_cancel:
+            parent.uncancel()
+
+
+def renew_scope_tokens(db_path, scope_tokens, *, pid, start_identity, safety_fence=None, now=None):
+    """Atomically renew an existing exact process-bound scope group, never debit."""
+    from tools.authority_ledger import deny_worker_database, process_start
+    deny_worker_database()
+    if (not isinstance(scope_tokens, dict) or not scope_tokens or type(pid) is not int
+            or pid < 1 or not start_identity or process_start(pid) != start_identity
+            or any(not isinstance(scope, str) or not scope or not isinstance(token, str) or not token
+                   for scope, token in scope_tokens.items())
+            or len(set(scope_tokens.values())) != len(scope_tokens)):
+        raise RuntimeError('PROXY_UNAVAILABLE')
+    now = time.time() if now is None else float(now)
+    if not math.isfinite(now):
+        raise ValueError('invalid renewal time')
+    with sqlite3.connect(db_path, timeout=.2) as connection:
+        if safety_fence:
+            connection.execute('ATTACH DATABASE ? AS safety', (safety_fence['db_path'],))
+        connection.execute('BEGIN IMMEDIATE')
+        validate_safety_connection(connection, safety_fence, now)
+        for scope, token in scope_tokens.items():
+            row = connection.execute('SELECT l.platform,l.pid,i.start_identity FROM request_scheduler_leases l JOIN crawler_authority_process_leases i ON i.token=l.token AND i.pid=l.pid WHERE l.token=?', (token,)).fetchone()
+            state = connection.execute('SELECT cooldown_until FROM request_scheduler_state WHERE platform=?', (scope,)).fetchone()
+            if row != (scope, pid, start_identity) or state and state[0] > now:
+                raise RuntimeError('PROXY_UNAVAILABLE')
+        expires_at = now + MEDIA_LEASE_SECONDS
+        for scope, token in scope_tokens.items():
+            connection.execute('UPDATE request_scheduler_leases SET expires_at=? WHERE token=? AND platform=? AND pid=?', (expires_at, token, scope, pid))
+        return {'expires_at': expires_at}
+
+
 def jitter_factor(jitter, *, lengthen_only=False):
     """Random pacing multiplier in [1-jitter, 1+jitter], never below 0.5; 0 disables.
 
@@ -34,6 +116,8 @@ class RequestScheduler:
                  max_concurrency=1, media_interval=5.0, cooldown_seconds=300.0,
                  jitter=0.0, lengthen_only_jitter=False, replace_policy=False,
                  clock=time.time, sleeper=time.sleep):
+        from tools.authority_ledger import deny_worker_database
+        deny_worker_database()
         if not str(db_path).strip():
             raise ValueError('request scheduler database is required')
         numbers = (min_interval, per_minute, max_concurrency, media_interval, cooldown_seconds)
@@ -58,6 +142,7 @@ class RequestScheduler:
             if 'last_start' not in {row[1] for row in c.execute('PRAGMA table_info(request_scheduler_channels)')}:
                 c.execute('ALTER TABLE request_scheduler_channels ADD COLUMN last_start REAL NOT NULL DEFAULT 0')
             c.execute('CREATE TABLE IF NOT EXISTS request_scheduler_leases (token TEXT PRIMARY KEY, platform TEXT, pid INTEGER, expires_at REAL)')
+            c.execute('CREATE TABLE IF NOT EXISTS crawler_authority_process_leases (token TEXT PRIMARY KEY, pid INTEGER NOT NULL, start_identity TEXT NOT NULL)')
             c.execute('CREATE TABLE IF NOT EXISTS request_scheduler_migrations (name TEXT PRIMARY KEY)')
             c.execute('CREATE TABLE IF NOT EXISTS request_scheduler_policy (platform TEXT PRIMARY KEY, limits_json TEXT NOT NULL)')
             limits = json.dumps([self.min_interval, self.per_minute, self.max_concurrency, self.media_interval])
@@ -109,6 +194,7 @@ class RequestScheduler:
     def release(self, token):
         with self._connect() as c:
             c.execute('DELETE FROM request_scheduler_leases WHERE token=?', (token,))
+            c.execute('DELETE FROM crawler_authority_process_leases WHERE token=?', (token,))
 
     def acquire(self, operation='api'):
         waited = 0.0
@@ -176,24 +262,30 @@ class PersistentRequestGate:
 
     @asynccontextmanager
     async def slot(self, operation='api', *, timeout=60, max_wait=300):
-        if not math.isfinite(timeout) or timeout <= 0:
+        renewable = operation == 'media' and timeout is None
+        if not renewable and (timeout is None or not math.isfinite(timeout) or timeout <= 0):
             raise ValueError('finite request timeout is required')
-        token, waited = await self._reserve(operation, lease_seconds=timeout + 30, max_wait=max_wait)
+        token, waited = await self._reserve(operation, lease_seconds=MEDIA_LEASE_SECONDS if renewable else timeout + 30, max_wait=max_wait)
         try:
-            # A live request cannot outlive its lease: total timeout, not only per-read timeout.
-            async with asyncio.timeout(timeout):
-                yield waited
+            if renewable:
+                from tools.authority_ledger import process_start
+                pid = os.getpid()
+                identity = process_start(pid)
+                async def renew():
+                    await asyncio.to_thread(renew_scope_tokens, self.state.db_path, {self.state.platform: token}, pid=pid, start_identity=identity)
+                async with renewable_media_lifetime(renew):
+                    yield waited
+            else:
+                async with asyncio.timeout(timeout):
+                    yield waited
         finally:
-            self.state.release(token)
+            release_scope_tokens(self.state.db_path, {self.state.platform: token})
 
 
 def scheduler_db_path(db_path=''):
     path = str(db_path).strip() or os.getenv('MEDIACRAWLER_REQUEST_SCHEDULER_DB', '').strip()
-    if not path:
-        root = os.getenv('MEDIACRAWLER_CLOAK_PROFILE_ROOT', '').strip()
-        if not root or not Path(root).is_absolute():
-            raise ValueError('Douyin requires --request_scheduler_db or an absolute MEDIACRAWLER_CLOAK_PROFILE_ROOT')
-        path = str(Path(root) / 'request_scheduler.sqlite3')
+    if not path or not Path(path).is_absolute():
+        raise ValueError('Douyin requires an explicit absolute request scheduler database')
     return path
 
 
@@ -220,7 +312,25 @@ def _scope_ids(scope_ids):
     return sorted(set(values))
 
 
-def _try_reserve_scopes(db_path, scope_ids, operation, lease_seconds, now, jitter_options=None, safety_fence=None):
+def validate_safety_connection(c, safety_fence, now):
+    if not safety_fence:
+        return
+    row = c.execute('SELECT generation,observed_at,paused_until,pause_reason FROM safety.crawler_shared_exits WHERE exit_key=?', (safety_fence['exit_ip'],)).fetchone()
+    admission = c.execute('SELECT account_id,exit_key,generation,state FROM safety.crawler_route_admissions WHERE operation_id=?', (safety_fence['operation_id'],)).fetchone()
+    account = c.execute('SELECT recovery_claim,recovery_state FROM safety.crawler_accounts WHERE id=?', (safety_fence['account_id'],)).fetchone()
+    recovery = bool(account and safety_fence.get('recovery_claim') and account[0] == safety_fence['recovery_claim'] and account[1] in {'claimed','manual_claimed'})
+    if recovery and account[1]=='manual_claimed':
+        recovery=bool(c.execute("SELECT 1 FROM safety.crawler_manual_recovery_operations WHERE account_id=? AND claim=? AND owner_id=? AND state='claimed'",(safety_fence['account_id'],safety_fence['recovery_claim'],safety_fence['owner_id'])).fetchone())
+    if (not row or row[0] != safety_fence['generation'] or (row[3] and not recovery)
+            or not 0 <= now - row[1] <= safety_fence['ttl']
+            or (row[2] is not None and row[2] > now and not (recovery and account[1]=='manual_claimed'))
+            or not admission or tuple(admission) != (safety_fence['account_id'], safety_fence['exit_ip'], safety_fence['generation'], 'active')):
+        raise RuntimeError('ACCOUNT_CHALLENGE')
+
+
+def _try_reserve_scopes(db_path, scope_ids, operation, lease_seconds, now, jitter_options=None, safety_fence=None, authority=None):
+    from tools.authority_ledger import deny_worker_database
+    deny_worker_database()
     scopes = _scope_ids(scope_ids)
     now = float(now)
     if not math.isfinite(now) or (lease_seconds is not None and
@@ -232,18 +342,12 @@ def _try_reserve_scopes(db_path, scope_ids, operation, lease_seconds, now, jitte
         if safety_fence:
             c.execute('ATTACH DATABASE ? AS safety', (safety_fence['db_path'],))
         c.execute('BEGIN IMMEDIATE')
-        if safety_fence:
-            row = c.execute('SELECT generation,observed_at,paused_until,pause_reason FROM safety.crawler_shared_exits WHERE exit_key=?', (safety_fence['exit_ip'],)).fetchone()
-            admission = c.execute('SELECT account_id,exit_key,generation,state FROM safety.crawler_route_admissions WHERE operation_id=?', (safety_fence['operation_id'],)).fetchone()
-            account = c.execute('SELECT recovery_claim,recovery_state FROM safety.crawler_accounts WHERE id=?', (safety_fence['account_id'],)).fetchone()
-            recovery = bool(account and safety_fence.get('recovery_claim') and account[0] == safety_fence['recovery_claim'] and account[1] in {'claimed','manual_claimed'})
-            if recovery and account[1]=='manual_claimed':
-                recovery=bool(c.execute("SELECT 1 FROM safety.crawler_manual_recovery_operations WHERE account_id=? AND claim=? AND owner_id=? AND state='claimed'",(safety_fence['account_id'],safety_fence['recovery_claim'],safety_fence['owner_id'])).fetchone())
-            if (not row or row[0] != safety_fence['generation'] or (row[3] and not recovery)
-                    or not 0 <= now - row[1] <= safety_fence['ttl']
-                    or (row[2] is not None and row[2] > now and not (recovery and account[1]=='manual_claimed'))
-                    or not admission or tuple(admission) != (safety_fence['account_id'], safety_fence['exit_ip'], safety_fence['generation'], 'active')):
-                raise RuntimeError('ACCOUNT_CHALLENGE')
+        if authority:
+            from tools.authority_ledger import lookup, record
+            previous = lookup(c, authority)
+            if previous is not None:
+                return previous
+        validate_safety_connection(c, safety_fence, now)
         for scope in scopes:
             policy_row = c.execute('SELECT limits_json FROM request_scheduler_policy WHERE platform=?', (scope,)).fetchone()
             try:
@@ -272,8 +376,14 @@ def _try_reserve_scopes(db_path, scope_ids, operation, lease_seconds, now, jitte
                     scope_target, scope_reason = max(channel[0], channel[1] + media_interval), 'media_interval'
             active = []
             for token, pid, expires in c.execute('SELECT token,pid,expires_at FROM request_scheduler_leases WHERE platform=?', (scope,)).fetchall():
-                if not RequestScheduler._alive(pid):
+                identity_table = c.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='crawler_authority_process_leases'").fetchone()
+                identity = c.execute('SELECT start_identity FROM crawler_authority_process_leases WHERE token=?',(token,)).fetchone() if identity_table else None
+                from tools.authority_ledger import process_start
+                alive = RequestScheduler._alive(pid) and (not identity or process_start(pid) == identity[0])
+                if not alive:
                     c.execute('DELETE FROM request_scheduler_leases WHERE token=?', (token,))
+                    if identity_table:
+                        c.execute('DELETE FROM crawler_authority_process_leases WHERE token=?',(token,))
                 else:
                     # A live operation may hold a body/browser beyond its deadline;
                     # only explicit completion or process death releases capacity.
@@ -286,7 +396,10 @@ def _try_reserve_scopes(db_path, scope_ids, operation, lease_seconds, now, jitte
                 target, reason = scope_target, scope_reason
             pending.append((scope, times, interval, media_interval, jitter, lengthen_only))
         if target > now:
-            return dict(delay=target - now, reason=reason, scope_tokens={})
+            result = dict(delay=target - now, reason=reason, scope_tokens={})
+            if authority:
+                record(c, authority, result)
+            return result
         tokens = {}
         for scope, times, interval, media_interval, jitter, lengthen_only in pending:
             times.append(now)
@@ -297,9 +410,19 @@ def _try_reserve_scopes(db_path, scope_ids, operation, lease_seconds, now, jitte
                 c.execute("INSERT INTO request_scheduler_channels(platform,channel,next_at,last_start) VALUES (?,'media',?,?) ON CONFLICT(platform,channel) DO UPDATE SET next_at=excluded.next_at,last_start=excluded.last_start", (scope, now + media_interval, now))
             if lease_seconds is not None:
                 token = uuid4().hex
-                c.execute('INSERT INTO request_scheduler_leases VALUES (?,?,?,?)', (token, scope, os.getpid(), now + lease_seconds))
+                c.execute('INSERT INTO request_scheduler_leases VALUES (?,?,?,?)', (token, scope, authority['pid'] if authority else os.getpid(), now + lease_seconds))
+                from tools.authority_ledger import process_start
+                lease_pid = authority['pid'] if authority else os.getpid()
+                identity = (authority.get('start_identity') if authority else None) or process_start(lease_pid)
+                if not identity:
+                    raise RuntimeError('PROXY_UNAVAILABLE')
+                c.execute('INSERT INTO crawler_authority_process_leases VALUES(?,?,?)',(token,lease_pid,identity))
                 tokens[scope] = token
-        return dict(delay=0., reason='ready', scope_tokens=tokens)
+        result = dict(delay=0., reason='ready', scope_tokens=tokens)
+        if authority:
+            result.update(grant=uuid4().hex, grant_expires_at=now+5)
+            record(c, authority, result)
+        return result
 
 
 def try_reserve_scopes(db_path, scope_ids, operation='api', lease_seconds=None, now=None, safety_fence=None):
@@ -318,12 +441,19 @@ def try_reserve_scopes(db_path, scope_ids, operation='api', lease_seconds=None, 
 
 
 def release_scope_tokens(db_path, scope_tokens):
+    from tools.authority_ledger import deny_worker_database
+    deny_worker_database()
     with sqlite3.connect(db_path, timeout=.2) as c:
         c.executemany('DELETE FROM request_scheduler_leases WHERE platform=? AND token=?',
                       list(scope_tokens.items()))
+        if c.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='crawler_authority_process_leases'").fetchone():
+            c.executemany('DELETE FROM crawler_authority_process_leases WHERE token=?',
+                          [(token,) for token in scope_tokens.values()])
 
 
 def enter_cooldown_scopes(db_path, scope_ids, reason, seconds=300, now=None):
+    from tools.authority_ledger import deny_worker_database
+    deny_worker_database()
     scopes = _scope_ids(scope_ids)
     if not math.isfinite(seconds) or seconds < 0:
         raise ValueError('invalid cooldown')
@@ -412,13 +542,24 @@ class MultiScopeGate:
 
     @asynccontextmanager
     async def slot_scopes(self, operation='api', *, timeout=60, max_wait=300):
-        if not math.isfinite(timeout) or timeout <= 0:
+        renewable = operation == 'media' and timeout is None
+        if not renewable and (timeout is None or not math.isfinite(timeout) or timeout <= 0):
             raise ValueError('finite request timeout is required')
         tokens, waited = await self.reserve_scopes(operation,
-            lease_seconds=timeout + 30, max_wait=max_wait)
+            lease_seconds=MEDIA_LEASE_SECONDS if renewable else timeout + 30, max_wait=max_wait)
         try:
-            async with asyncio.timeout(timeout):
-                yield waited
+            if renewable:
+                from tools.authority_ledger import process_start
+                pid = os.getpid()
+                identity = process_start(pid)
+                async def renew():
+                    await asyncio.to_thread(renew_scope_tokens, self.db_path, tokens,
+                        pid=pid, start_identity=identity, safety_fence=self.safety_fence)
+                async with renewable_media_lifetime(renew, self.stop_checker):
+                    yield waited
+            else:
+                async with asyncio.timeout(timeout):
+                    yield waited
         finally:
             release_scope_tokens(self.db_path, tokens)
 
@@ -438,6 +579,8 @@ class MultiScopeGate:
 
 
 def _scope_snapshot(db_path, scope, now):
+    from tools.authority_ledger import deny_worker_database
+    deny_worker_database()
     with sqlite3.connect(db_path, timeout=.2) as c:
         row = c.execute('SELECT next_allowed_at,cooldown_until,request_times_json,last_reason FROM request_scheduler_state WHERE platform=?', (scope,)).fetchone()
         active = c.execute('SELECT pid,expires_at FROM request_scheduler_leases WHERE platform=?', (scope,)).fetchall()

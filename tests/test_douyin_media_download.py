@@ -136,3 +136,177 @@ async def test_media_and_refresh_slots_share_spacing(monkeypatch):
             return loop.time()
     starts = sorted(await asyncio.gather(*(reserve() for _ in range(3))))
     assert all(b - a >= 0.018 for a, b in zip(starts, starts[1:]))
+
+
+@pytest.mark.asyncio
+async def test_media_hop_total_timeout_closes_body_releases_slot_and_tries_backup(monkeypatch):
+    from contextlib import asynccontextmanager
+    closed=[];released=[];calls=[]
+    class Body(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield b'first'
+            await asyncio.sleep(1)
+        async def aclose(self):closed.append(True)
+    @asynccontextmanager
+    async def slot(operation,**kwargs):
+        try:
+            async with asyncio.timeout(.02 if kwargs['timeout'] is None else kwargs['timeout']):yield 0
+        finally:released.append(operation)
+    def handler(request):
+        calls.append(request.url.host)
+        return httpx.Response(200,headers={'Content-Type':'video/mp4'},
+            stream=Body()) if request.url.host=='slow.example' else httpx.Response(200,content=b'backup-video',headers={'Content-Type':'video/mp4'})
+    monkeypatch.setattr(client_module,'make_async_client',lambda **kw:httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+    client=make_client();client.timeout=.02
+    client._persistent_gate=type('Gate',(),{'slot':staticmethod(slot)})()
+    crawler=DouYinCrawler();crawler.dy_client=client
+    saved=AsyncMock();monkeypatch.setattr(store,'update_dy_aweme_video',saved)
+    await crawler.get_aweme_video(item('https://backup.example/video','https://slow.example/video'))
+    assert calls==['slow.example','backup.example']
+    assert closed==[True] and released==['media','media']
+    assert saved.await_args.args[1]==b'backup-video'
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('outer_expires',[False,True])
+async def test_trial_timeout_only_spends_budget_when_its_own_deadline_expires(outer_expires):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+    from tools.collection_route import CollectionRouteError
+    client=make_client();client.timeout=.01
+    trial=SimpleNamespace(begin_media=Mock(return_value='token'),media_timeout=Mock(return_value=.01 if outer_expires else 1),finish_media=Mock())
+    bound=SimpleNamespace(trial_limits=trial,authority=None,fail=Mock(side_effect=lambda code:CollectionRouteError(code)))
+    client._bound_proxy_session=bound
+    async def send(*args,**kwargs):
+        if outer_expires:await asyncio.sleep(1)
+        raise MediaDownloadError('media_total_timeout')
+    client._send=send
+    expected=CollectionRouteError if outer_expires else MediaDownloadError
+    with pytest.raises(expected,match='PROBE_BUDGET_EXHAUSTED' if outer_expires else 'media_total_timeout'):
+        await client.get_aweme_media('https://media.example/video',raise_on_error=True)
+    assert bound.fail.call_count==int(outer_expires)
+    trial.finish_media.assert_called_once_with('token')
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('error',[asyncio.CancelledError(),PlatformRateLimitedError('PLATFORM_RATE_LIMITED'),RuntimeError('PROBE_BUDGET_EXHAUSTED'),DataFetchError('ACCOUNT_VERIFY')])
+async def test_media_safety_and_external_cancel_never_fall_back(monkeypatch,error):
+    crawler=DouYinCrawler();crawler.dy_client=make_client()
+    crawler.dy_client.get_aweme_media=AsyncMock(side_effect=error)
+    with pytest.raises(type(error)):
+        await crawler.get_aweme_video(item('https://backup.example/video','https://first.example/video'))
+    assert crawler.dy_client.get_aweme_media.await_count==1
+
+
+@pytest.mark.asyncio
+async def test_media_route_loss_is_not_converted_to_candidate_failure():
+    from tools.collection_route import CollectionRouteError
+    client=make_client()
+    client._send=AsyncMock(side_effect=CollectionRouteError('PROXY_REVISION_MISMATCH'))
+    with pytest.raises(CollectionRouteError,match='PROXY_REVISION_MISMATCH'):
+        await client.get_aweme_media('https://cdn.example/video',raise_on_error=True)
+    client._send=AsyncMock(side_effect=DataFetchError('ACCOUNT_VERIFY'))
+    with pytest.raises(DataFetchError,match='ACCOUNT_VERIFY'):
+        await client.get_aweme_media('https://cdn.example/video',raise_on_error=True)
+
+
+@pytest.mark.asyncio
+async def test_continuous_media_chunks_outlive_old_timeout_without_extending_httpx_idle(monkeypatch):
+    from contextlib import asynccontextmanager
+    closed=[];released=[];http_timeouts=[];gate_timeouts=[]
+    class Body(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            for _ in range(5):
+                await asyncio.sleep(.015)
+                yield b'chunk'
+        async def aclose(self):closed.append(True)
+    @asynccontextmanager
+    async def slot(operation,**kwargs):
+        gate_timeouts.append(kwargs['timeout'])
+        try:
+            async with asyncio.timeout(kwargs['timeout']):yield 0
+        finally:released.append(True)
+    def handler(request):
+        http_timeouts.append(request.extensions['timeout'])
+        return httpx.Response(200,headers={'Content-Type':'video/mp4'},stream=Body())
+    monkeypatch.setattr(client_module,'make_async_client',lambda **kw:httpx.AsyncClient(transport=httpx.MockTransport(handler)))
+    client=make_client();client.timeout=.02
+    client._persistent_gate=type('Gate',(),{'slot':staticmethod(slot)})()
+    assert await client.get_aweme_media('https://media.example/video',raise_on_error=True)==b'chunk'*5
+    assert gate_timeouts==[None] and closed==[True] and released==[True]
+    assert http_timeouts==[dict(connect=.02,read=.02,write=.02,pool=.02)]
+
+
+@pytest.mark.asyncio
+async def test_httpx_idle_timeout_still_closes_media_and_releases_slot(monkeypatch):
+    from contextlib import asynccontextmanager
+    closed=[];released=[]
+    class Body(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            yield b'first'
+            raise httpx.ReadTimeout('fixture read inactivity')
+        async def aclose(self):closed.append(True)
+    @asynccontextmanager
+    async def slot(*args,**kwargs):
+        try:yield 0
+        finally:released.append(True)
+    monkeypatch.setattr(client_module,'make_async_client',lambda **kw:httpx.AsyncClient(transport=httpx.MockTransport(
+        lambda request:httpx.Response(200,headers={'Content-Type':'video/mp4'},stream=Body()))))
+    client=make_client();client._persistent_gate=type('Gate',(),{'slot':staticmethod(slot)})()
+    with pytest.raises(MediaDownloadError,match='ReadTimeout'):
+        await client.get_aweme_media('https://media.example/video',raise_on_error=True)
+    assert closed==[True] and released==[True]
+
+
+@pytest.mark.asyncio
+async def test_trial_remaining_limits_total_media_budget_without_raising_idle_timeout():
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+    client=make_client();client.timeout=60
+    trial=SimpleNamespace(begin_media=Mock(return_value='token'),media_timeout=Mock(return_value=4),finish_media=Mock())
+    client._bound_proxy_session=SimpleNamespace(trial_limits=trial,authority=None)
+    client._send=AsyncMock(return_value=httpx.Response(200,content=b'video',headers={'Content-Type':'video/mp4'},request=httpx.Request('GET','https://media.example/video')))
+    assert await client.get_aweme_media('https://media.example/video',raise_on_error=True)==b'video'
+    assert 'media_total_timeout' not in client._send.await_args.kwargs
+    assert client._send.await_args.kwargs['timeout']==4
+    trial.finish_media.assert_called_once_with('token')
+
+
+@pytest.mark.asyncio
+async def test_external_cancellation_closes_body_and_releases_media_slot(monkeypatch):
+    from contextlib import asynccontextmanager
+    closed=[];released=[];reading=asyncio.Event()
+    class Body(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            reading.set()
+            await asyncio.sleep(10)
+            yield b'never'
+        async def aclose(self):closed.append(True)
+    @asynccontextmanager
+    async def slot(*args,**kwargs):
+        try:
+            async with asyncio.timeout(kwargs['timeout']):yield 0
+        finally:released.append(True)
+    monkeypatch.setattr(client_module,'make_async_client',lambda **kw:httpx.AsyncClient(transport=httpx.MockTransport(
+        lambda request:httpx.Response(200,headers={'Content-Type':'video/mp4'},stream=Body()))))
+    client=make_client();client._persistent_gate=type('Gate',(),{'slot':staticmethod(slot)})()
+    task=asyncio.create_task(client.get_aweme_media('https://media.example/video',raise_on_error=True))
+    await reading.wait();task.cancel()
+    with pytest.raises(asyncio.CancelledError):await task
+    assert closed==[True] and released==[True]
+
+
+@pytest.mark.asyncio
+async def test_api_budget_is_unchanged_by_media_setting(monkeypatch):
+    from contextlib import asynccontextmanager
+    gate_timeouts=[]
+    @asynccontextmanager
+    async def slot(operation,**kwargs):
+        gate_timeouts.append((operation,kwargs['timeout']))
+        yield 0
+    monkeypatch.setenv('MEDIACRAWLER_DY_MEDIA_TOTAL_TIMEOUT_SECONDS','1')
+    monkeypatch.setattr(client_module,'make_async_client',lambda **kw:httpx.AsyncClient(transport=httpx.MockTransport(
+        lambda request:httpx.Response(200,json={'ok':True}))))
+    client=make_client();client._persistent_gate=type('Gate',(),{'slot':staticmethod(slot)})()
+    await client._send('GET','https://api.example/item',operation='api',timeout=60)
+    assert gate_timeouts==[('api',60)]

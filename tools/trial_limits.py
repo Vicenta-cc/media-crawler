@@ -43,6 +43,8 @@ class SharedTrialLimits:
     MAX_MEDIA_SECONDS = 300.
 
     def __init__(self, db_path, trial_id, *, clock=time.time):
+        from tools.authority_ledger import deny_worker_database
+        deny_worker_database()
         self.trial_id = _trial_id(trial_id)
         if not str(db_path).strip():
             raise ValueError('TRIAL_LIMITS_INVALID')
@@ -123,7 +125,7 @@ class SharedTrialLimits:
             if files >= self.MAX_MEDIA_FILES or size >= self.MAX_MEDIA_BYTES or seconds >= self.MAX_MEDIA_SECONDS:
                 self._stop(c)
             token = uuid4().hex
-            c.execute('INSERT INTO proxy_trial_media(token,trial_id,started_at,pid) VALUES(?,?,?,?)', (token, self.trial_id, now, os.getpid()))
+            c.execute('INSERT INTO proxy_trial_media(token,trial_id,started_at,pid) VALUES(?,?,?,?)', (token, self.trial_id, now, getattr(self, 'owner_pid', os.getpid())))
             c.execute('UPDATE proxy_trial_limits SET media_files=media_files+1 WHERE trial_id=?', (self.trial_id,))
             return token
 
@@ -193,4 +195,11 @@ class SharedTrialLimits:
 
 
 def from_env(snapshot_scheduler_db, *, env=None, clock=time.time):
+    values = os.environ if env is None else env
+    if values.get('MEDIACRAWLER_DY_BROWSER_ENGINE') == 'camoufox' or values.get('MEDIACRAWLER_REQUEST_AUTHORITY_FD'):
+        # BoundProxySession installs its prebound RemoteTrial; never construct a
+        # second channel or reopen business databases from a worker.
+        if values.get(TRIAL_ID_ENV, ''):
+            raise RuntimeError('PROBE_BUDGET_EXHAUSTED')
+        return None
     return SharedTrialLimits.from_env(snapshot_scheduler_db, env=env, clock=clock)

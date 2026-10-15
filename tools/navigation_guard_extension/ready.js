@@ -1,0 +1,1 @@
+browser.runtime.sendMessage({type:"policy-ready"}).then(result => {document.body.dataset.ready = String(result.ready && result.headersReady && result.version === 1);document.body.dataset.blocked = String(result.blocked);});
