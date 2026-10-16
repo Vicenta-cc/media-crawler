@@ -29,6 +29,7 @@ async def test_detail_uses_current_same_account_identity_without_mutating_shared
 async def test_gateway_rejection_still_fails_after_identity_compatibility():
     client = DouYinClient.__new__(DouYinClient)
     client._host = 'https://www.douyin.com'
+    client._bound_proxy_session = None
     client.headers = {'User-Agent': 'test'}
     client.cookie_dict = {'UIFID': 'identity', 's_v_web_id': 'fp'}
     client._DouYinClient__process_req_params = AsyncMock()

@@ -89,7 +89,7 @@ async def test_zero_retries_keeps_the_old_single_attempt(monkeypatch):
 
 
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 from media_platform.douyin.exception import DataFetchError, PlatformRateLimitedError
 
 
@@ -160,8 +160,69 @@ async def test_http_rejection_not_retried(monkeypatch, status, expected):
 @pytest.mark.asyncio
 async def test_invalid_login_still_uses_original_signal(monkeypatch):
     crawler, page, _ = _crawler(monkeypatch, [])
+    crawler.LOGIN_READINESS_TIMEOUT_SECONDS = 0
     crawler.create_douyin_client = AsyncMock(return_value=SimpleNamespace(pong=AsyncMock(return_value=False)))
     await crawler._open_index_page()
     with pytest.raises(RuntimeError, match="ACCOUNT_AUTH_INVALID"):
         await crawler._check_login_with_page_recovery(None)
     assert len(page.urls) == 1
+
+
+@pytest.mark.asyncio
+async def test_bound_navigation_waits_for_dom_with_inner_deadline_first(monkeypatch):
+    from contextlib import asynccontextmanager
+    crawler, page, _ = _crawler(monkeypatch, [])
+    calls=[]
+    @asynccontextmanager
+    async def slot(operation, **kwargs):
+        calls.append((operation,kwargs))
+        yield
+    async def goto(url, **kwargs):
+        assert kwargs['wait_until']=='domcontentloaded'
+        assert kwargs['timeout'] < calls[-1][1]['timeout']*1000
+    page.goto=goto
+    crawler._bound_proxy_session=SimpleNamespace(slot=slot,fail=Mock())
+    await crawler._open_index_page()
+    assert calls[0][0]=='navigate'
+    crawler._bound_proxy_session.fail.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_navigation_timeout_does_not_mark_proxy_dead(monkeypatch):
+    from playwright.async_api import TimeoutError
+    crawler, _, _ = _crawler(monkeypatch,[TimeoutError('pending background resource')])
+    with pytest.raises(RuntimeError,match='PAGE_INITIALIZATION_TIMEOUT'):
+        await crawler._open_index_page()
+
+
+@pytest.mark.asyncio
+async def test_login_readiness_polls_only_ready_document_and_propagates_risk():
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    crawler=DouYinCrawler()
+    crawler.browser_context=SimpleNamespace()
+    crawler.LOGIN_READINESS_TIMEOUT_SECONDS=.1
+    crawler.context_page=SimpleNamespace(evaluate=AsyncMock(side_effect=[False,True]))
+    crawler.dy_client=SimpleNamespace(pong=AsyncMock(return_value=True))
+    assert await crawler._wait_for_login_readiness()
+    crawler.dy_client.pong.assert_awaited_once()
+    crawler.context_page.evaluate=AsyncMock(return_value=True)
+    crawler.dy_client.pong=AsyncMock(side_effect=RuntimeError('ACCOUNT_VERIFY'))
+    with pytest.raises(RuntimeError,match='ACCOUNT_VERIFY'):
+        await crawler._wait_for_login_readiness()
+
+
+@pytest.mark.asyncio
+async def test_login_readiness_deadline_and_stop_remain_enforced():
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+    crawler=DouYinCrawler()
+    crawler.browser_context=SimpleNamespace()
+    crawler.LOGIN_READINESS_TIMEOUT_SECONDS=0
+    crawler.context_page=SimpleNamespace(evaluate=AsyncMock(return_value=False))
+    crawler.dy_client=SimpleNamespace(pong=AsyncMock(return_value=True))
+    assert not await crawler._wait_for_login_readiness()
+    crawler.dy_client.pong.assert_not_awaited()
+    crawler._bound_proxy_session=SimpleNamespace(check_stop_async=AsyncMock(side_effect=RuntimeError('PROXY_EXIT_CHANGED')))
+    with pytest.raises(RuntimeError,match='PROXY_EXIT_CHANGED'):
+        await crawler._wait_for_login_readiness()

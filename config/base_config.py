@@ -99,9 +99,9 @@ SAVE_DATA_PATH = ""
 # Browser file configuration cached by the user's browser
 USER_DATA_DIR = "%s_user_data_dir"  # %s will be replaced by platform name
 
-# Douyin always uses account-bound CloakBrowser. Identity must be a stable account ID.
-DY_BROWSER_ENGINE = "cloakbrowser"
-DY_CLOAK_PROFILE_ROOT = "browser_data/cloakbrowser"
+# Douyin always uses account-bound Camoufox. Identity must be a stable account ID.
+DY_BROWSER_ENGINE = "camoufox"
+DY_CAMOUFOX_PROFILE_ROOT = "browser_data/camoufox"
 
 # The number of pages to start crawling starts from the first page by default
 START_PAGE = 1

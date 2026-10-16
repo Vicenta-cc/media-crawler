@@ -196,6 +196,10 @@ async def update_douyin_aweme(aweme_item: Dict):
         "note_download_url": ",".join(_extract_note_image_list(aweme_item)),
         "source_keyword": source_keyword_var.get(),
     }
+    if 'collection_route_provenance' in aweme_item:
+        from tools.collection_route import validate_collection_route_provenance
+        save_content_item['collection_route_provenance'] = validate_collection_route_provenance(
+            aweme_item['collection_route_provenance'])
     utils.logger.info(f"[store.douyin.update_douyin_aweme] douyin aweme id:{aweme_id}, title:{save_content_item.get('title')}")
     await DouyinStoreFactory.create_store().store_content(content_item=save_content_item)
 
