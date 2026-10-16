@@ -1,4 +1,8 @@
-# Audit Agent 配套 MediaCrawler 冻结版
+# Audit Agent 配套 MediaCrawler
+
+**2026-10-16 release 交接入口：** [本地启动与 Linux 部署交接](docs/RELEASE-20261016-LOCAL-AND-LINUX-HANDOFF.md)。本次已测配对为 media `7bd9d117cd1b0753990ba754c58b8c12de8f4ca5` + audit `1dadd4757b478b716ca0c0f4b7f649545d82a94f`；macOS 已完成抖音登录、复用登录态搜索和 1 条内容落盘。远端 Linux 部署仍须完成发布门槛及目标环境验收，详见交接文档。
+
+## 历史 R2 冻结版本
 
 当前 R2 配套爬虫提交：`efafe3186400b1020955c6acfdc201235b84a2d8`；冻结分支 `codex/douyin-v2-pagination-dedupe-20260914`；标签 `douyin-pagination-fix-20260916`。
 

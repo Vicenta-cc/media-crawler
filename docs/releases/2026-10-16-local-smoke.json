@@ -1,0 +1,58 @@
+{
+  "schema_version": 1,
+  "kind": "local_smoke_summary",
+  "date": "2026-10-16",
+  "timezone": "Asia/Shanghai",
+  "host_os": "macOS",
+  "audit_commit": "1dadd4757b478b716ca0c0f4b7f649545d82a94f",
+  "media_commit": "7bd9d117cd1b0753990ba754c58b8c12de8f4ca5",
+  "versions": {
+    "audit_python": "3.12.10",
+    "media_python": "3.11.15",
+    "camoufox_sdk": "0.5.8",
+    "playwright": "1.62.0",
+    "camoufox_browser": "156.0.1-beta.39"
+  },
+  "login": {
+    "ui_result": "success",
+    "identity_verified": true,
+    "account_status_after_crawl": "active"
+  },
+  "route": {
+    "mode": "proxy_required",
+    "browser_and_http_exit_agree": true,
+    "dedicated_local_http_proxy": true,
+    "existing_tun_retained": true
+  },
+  "crawl": {
+    "entrypoint": "audit.MediaCrawlerAdapter.run_search",
+    "platform": "dy",
+    "keyword": "风景",
+    "requested_count": 1,
+    "returned_count": 1,
+    "jsonl_record_count": 1,
+    "process_exit_code": 0,
+    "aweme_id": "7684858294619785134",
+    "collect_comments": false,
+    "collect_media": false,
+    "reused_authenticated_profile": true
+  },
+  "redis_required_for_this_smoke": false,
+  "private_evidence": {
+    "availability": "originals retained on test Mac, not included in repository",
+    "smoke_result_sha256": "b8153c2890aa1bf81deaa77062a4c0b33f6b3fe257e5e01f1b213e3ff8ac83bf",
+    "content_jsonl_sha256": "de6618b01f6dc9c29b04f67504c89b2d6921518e49709cd7f31eaba4bbe96522"
+  },
+  "not_validated": [
+    "comments",
+    "media_download",
+    "creator_collection",
+    "other_platforms",
+    "full_worker_investigation_review_report_and_qa",
+    "multi_user_authorization",
+    "linux_runtime_and_security_gates",
+    "restart_recovery",
+    "long_running_capacity"
+  ],
+  "production_cutover_approved": false
+}
