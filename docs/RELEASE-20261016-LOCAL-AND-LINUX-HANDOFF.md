@@ -2,19 +2,21 @@
 
 更新时间：2026-10-19（Asia/Shanghai）。本文件随 Media 的 `release/2026-10-16` 交接，供 Audit Agent 配套 MediaCrawler 使用。10 月 16 日的真实联网验证与后续离线修复记录分别保留，不将旧测试扩大为新版本或 Linux 的完整验收。
 
-**当前配套候选是 Audit `9a0ded4` + Media 业务代码 `7bd9d11`；Media 包含本文的 release 交付还含纯文档提交。Audit 最新本地提交与远端 release 不是同一概念，取码前必须按下表核对。Linux 正式切换、完整真实调查业务和其他平台尚未获得本次验收。**
+**已核实的远端起点是 Audit `709c392` + Media `32729e8`。本轮 Audit 修复已提交为 `f918dd6`（发布入口 dotenv 隔离）及 `be5ca8f`（历史分析记录链接），均已通过离线测试及两路独立 review；候选业务源码固定 `be5ca8ffab13975b41080dae5e33060d4690bd23`，后续仅文档提交须另记录完整 SHA。Media 业务代码仍为 `7bd9d11`。2026-10-19 已开始部署准备，推送及云端盘点结果以执行收据为准；尚未切换生产。**
 
 ## 1. 精确基线与取码
 
 | 组件/记录 | 精确提交 | 状态与用途 |
 | --- | --- | --- |
-| Audit 当前配套候选 | `9a0ded479d581ae03db77112843c9501ed36648d` | 用户确认的最新本地已提交代码；是 `db5d57f` 的后代，包含后续地域采集、媒体交接与恢复修复。本次文档更新不负责推送 Audit |
-| Audit 已发布 release（2026-10-19 核对） | `db5d57f8d4f2f88f6f7cb7ceb2bf4acaa85b6bb9` | 远端 `release/2026-10-16` 的实际指向；含累积集成、地域状态传递、登录状态换行及出口过期复查修复。不能声称远端 release 已包含 `9a0ded4` |
+| Audit 历史已推送起点 | `709c3929c5c584d3b596b83b813f7555e14c913d` | 包含 `9a0ded4` 累积修复、原帖发布时间修复及本地验收记录；发布入口 `.env` 补丁须另行提交后重新冻结 |
+| Audit 远端 release（补丁推送前核对） | `709c3929c5c584d3b596b83b813f7555e14c913d` | 已核实 `release/2026-10-16` 指向；`db5d57f` 保留为历史版本，不再作为当前取码目标 |
+| Audit 本轮候选业务源码 | `be5ca8ffab13975b41080dae5e33060d4690bd23` | 包含 dotenv 隔离 `f918dd6`、前端历史轮次补丁 `be5ca8f`；本次源码离线测试、类型检查、构建及独立 review 已通过，Linux 验收待执行 |
+| Media 已推送文档交付 | `32729e8b06cbf11f6aa153085852e3a44c1d05d8` | 远端 release 本次核对指向；相对 `7bd9d11` 没有业务源码改动 |
 | Media 业务代码基线 | `7bd9d117cd1b0753990ba754c58b8c12de8f4ca5` | 固定 tag `release-baseline-20261016-media`；后续 Audit 修复没有修改本仓库业务代码 |
 | Media 首次文档交付 | `0e00cfd2cf3e4c814e2761a928af4daecb2591cd` | 比 `7bd9d11` 仅增加 README、本文及冒烟 JSON；本次更新在此基础上只修改本文。实际部署记录本次文档提交的完整 SHA |
 | Audit 早期联网冒烟基线 | `1dadd4757b478b716ca0c0f4b7f649545d82a94f` | 历史 tag `release-baseline-20261016-audit`，仅用于还原早期验证；不作为当前候选取码目标 |
 
-`9a0ded4` 相对 `db5d57f` 有 12 个后续提交；它们的源码关系已检查，**不等于已经使用该完整版本重新完成真实登录、采集和报告验收**。本文保留历史 tag 指向，不移动 tag、不重写提交，也不把后续文档提交算作 Media 业务修复。
+`709c392` 包含 `9a0ded4`，相对 `db5d57f` 有 13 个后续提交；源码关系已检查，**不等于已经使用该完整版本重新完成真实登录、采集和报告验收**。本文保留历史 tag 指向，不移动 tag、不重写提交，也不把后续文档提交算作 Media 业务修复。
 
 Media 基线合并的两个父提交分别是：
 
@@ -28,7 +30,7 @@ Media release 已从第二个父提交 fast-forward 更新为“已测合并 + �
 | 位置（相对当前用户主目录） | 分支与用途 |
 | --- | --- |
 | `~/.codex/worktrees/geographic-integration/xhs-audit-agent-demo` | 早期 audit 冒烟 `codex/geographic-integration`，当时为 `1dadd47` |
-| `~/.codex/worktrees/new-media-app-integration/xhs-audit-agent-demo` | audit 累积集成分支 `codex/new-media-app-integration-20261016`，本次核对 HEAD 为 `9a0ded4`；本地修改不自动进入发布物 |
+| `~/.codex/worktrees/new-media-app-integration/xhs-audit-agent-demo` | audit 累积集成分支 `codex/new-media-app-integration-20261016`，本次核对已提交起点为 `709c392`；本轮修复已分别提交为 `f918dd6` / `be5ca8f`，后续文档提交另行记录 |
 | `~/.codex/worktrees/exit-refresh-release/xhs-audit-agent-demo` | 出口修复发布副本，HEAD `db5d57f` |
 | `~/.codex/worktrees/media-release-integration/media-crawler` | media `codex/media-release-integration-20261016`，业务代码 `7bd9d11`，随后仅追加交接文档 |
 | `~/Documents/Codex/projects/MediaCrawler-camoufox-runtime` | 后续出口过期实测使用的 media 运行副本，源码 `7bd9d11`；浏览器/模型资源在其独立 venv 中 |
@@ -36,20 +38,21 @@ Media release 已从第二个父提交 fast-forward 更新为“已测合并 + �
 
 不要将“原开发目录在本地”理解为“该目录就是已测基线”，也不要为对齐基线而 reset/覆盖原开发修改。
 
-以下命令用于**新目录准备候选源码**，不在正在运行的生产 checkout 中执行切换。Audit `9a0ded4` 必须先通过授权发布或受控源码交付，使部署环境能取得该对象；目前仅 clone 远端 release 不能保证取得它。若 `cat-file` 失败，应停止并补齐源码交付，不能静默改用 `db5d57f` 或旧 tag：
+以下命令固定**本轮候选业务源码**；先确认远端已包含该提交，再执行取码。不在运行中的生产 checkout 执行切换。Media 命令固定已推送的文档起点，实际候选须另记录包含本次交接更新的最终文档提交。两仓库均显式固定 SHA，`cat-file` 失败时停止，不静默改用旧 tag：
 
 ```bash
 set -e
 git clone --branch release/2026-10-16 git@github.com:Vicenta-cc/audit-agent-demo.git audit-agent-demo
-git -C audit-agent-demo cat-file -e '9a0ded479d581ae03db77112843c9501ed36648d^{commit}'
-git -C audit-agent-demo checkout --detach 9a0ded479d581ae03db77112843c9501ed36648d
+git -C audit-agent-demo cat-file -e 'be5ca8ffab13975b41080dae5e33060d4690bd23^{commit}'
+git -C audit-agent-demo checkout --detach be5ca8ffab13975b41080dae5e33060d4690bd23
 git clone --branch release/2026-10-16 git@github.com:Vicenta-cc/media-crawler.git media-crawler
-git -C media-crawler checkout --detach
+git -C media-crawler cat-file -e '32729e8b06cbf11f6aa153085852e3a44c1d05d8^{commit}'
+git -C media-crawler checkout --detach 32729e8b06cbf11f6aa153085852e3a44c1d05d8
 git -C audit-agent-demo rev-parse HEAD
 git -C media-crawler rev-parse HEAD
 ```
 
-上面 Media 保留新 clone 时取得的 release 提交（含更新后的本文）。执行前先确认它只比 `7bd9d11` 多文档；本次已核对 `0e00cfd` 只涉及三份文档，本次追加提交只涉及本文。如果远端又出现源码改动，重新核对并冻结，不能沿用本次测试结论。生产构建从冻结的完整 SHA 取码，不在构建中再次追随浮动分支。若另行决定部署已发布的 Audit `db5d57f`，须明确记录它不包含后续 12 个提交，不能作为 `9a0ded4` 的替代而不说明。
+已核对 Media `7bd9d11..32729e8` 仅涉及 README、本文和冒烟 JSON；`32729e8` 单独只修改本文。本轮文档修订尚未包含在 `32729e8`，若要随发布交付，提交后记录新的文档 SHA。若后续出现业务源码改动，重新核对配套关系并验收。生产构建从最终冻结的完整 SHA 取码，不在构建中追随浮动分支；历史 `db5d57f` 或 `1dadd47` 不能静默替代新起点。
 
 HTTPS 地址为 `https://github.com/Vicenta-cc/media-crawler.git`。若本机网络阻断 GitHub SSH 22，可为单次 Git 命令使用 `-c core.sshCommand='ssh -p 443 -o Hostname=ssh.github.com -o BatchMode=yes'`；这只解决 Git 传输，不等于解决采集代理。无需因此更改服务器全局 SSH 或代理配置。
 
@@ -111,7 +114,7 @@ HTTPS 地址为 `https://github.com/Vicenta-cc/media-crawler.git`。若本机网
 - `GEOGRAPHIC-RECOVERY-FIX-20261016.md`：恢复、出口刷新及早期修复记录。
 - `GEOGRAPHIC-PREFILTER-FALLBACK-20261017.md`、`DRAFT-REGION-RESOLUTION-20261017.md`：预筛纠错、待判定和草案解析。
 
-在 Audit 候选可从 GitHub 取得前，不把这些文件的本地存在描述成远端已发布。部署者应检查该精确源码中的记录，并在目标环境重新验证 `APP_AUTH_MODE=required` 下的登录、采集、媒体交接、报告及重启恢复。
+上述记录已随 Audit `709c392` 进入远端 release；本机 API/worker 配置仍固定 `16fca47`，不能把源码推送当作已加载或已完成 Linux 验收。`709c392` 的 `docs/runtime/LOCAL-3499-ACCEPTANCE-20261017.md` 补录了本地大火调查两条审核和已发布报告，但其完整问询、跨报告及全部修复重启验收仍有缺口。部署者应检查精确源码中的记录，并在目标环境重新验证 `APP_AUTH_MODE=required` 下的登录、采集、媒体交接、报告及重启恢复。
 
 ## 3. 本地启动前的准备
 
@@ -144,6 +147,12 @@ PY
 Media `tools/camoufox_browser.py` 在新建指纹时会拒绝模型缺失/哈希不符或自定义 `FPGEN_MODEL_URL`，因此这类资源问题可能表现为登录浏览器未启动、没有二维码。模型和浏览器在构建阶段准备并冻结摘要；生产不能靠首次请求联网下载、换模型或修改校验逻辑修复。
 
 **当前依赖清单存在未修复差异：** `requirements.txt` 为 Pillow `12.1.0`，`pyproject.toml` / `uv.lock` 为 `9.5.0`，本机后续实测 venv 安装的是 `12.1.0`。两种安装入口不等价；本文没有修改依赖文件，也不声称较旧版本一定出错。部署前应统一选定并验证完整安装清单，生成 App/Crawler 各自传递依赖齐全的哈希锁及 Linux wheelhouse，执行 `pip check` 并记录实际版本。不要把普通 requirements 的范围依赖或现有 uv.lock 直接当成已验证的离线发布锁。Python `>=3.11` 是源码约束；原实测 Media `3.11.15`、Audit `3.12.10` 不代表其他解释器或 Linux 构建组合已通过验收。
+
+补核发现两入口还存在 `aiosqlite`（固定 0.21.0 / 下界 0.21.0）、`pyhumps`（固定 3.8.0 / 下界 3.8.0）、`opencv-python`（无版本约束 / 下界 4.11.0.86）的差异；pyproject 还声明 pre-commit、websockets、asyncpg。不能只改 Pillow 就声称两入口等价。当前只完成核对，未擅自升级或删依赖。
+
+Audit 的 `requirements-hermes.txt` 包含固定 Git 提交依赖，须在构建环境先制成 wheel，再与所有传递依赖锁定摘要。现有 `build.py` 用调用它的 Python 创建两套 venv；Linux 预演以明确的目标 Python 3.11 执行，不能误用系统默认解释器或搬运 Mac venv。正式构建仍要求两套独立完整哈希锁、匹配 Linux x86_64 的 wheelhouse 以及 `pip check`；这些产物本轮尚未制作。
+
+本地测试覆盖、数据库与候选参数的核对表，以及发布入口补丁/验收边界见 Audit 本轮新增 `docs/runtime/DEPLOYMENT-READINESS-20261019.md`；该文件提交前不宣称已在远端可取。生产参数尚未从云端盘点，不将默认值或本地小样本值直接批准为正式值。
 
 ### 3.1 已验证的本地配置组合
 
@@ -245,14 +254,14 @@ VITE_API_PROXY_TARGET=http://127.0.0.1:8499 ./node_modules/.bin/vite --host 127.
 
 ## 6. Linux 部署步骤与停止条件
 
-本次 Mac 实测不能批准生产切换。配套 Audit 已发布版本的 [Camoufox 发布契约](https://github.com/Vicenta-cc/audit-agent-demo/blob/db5d57f8d4f2f88f6f7cb7ceb2bf4acaa85b6bb9/deploy/camoufox/README.md)明确写有 **G0 安全审核尚未关闭**；已核对 `9a0ded4` 未修改该部署工具目录。本次没有连接服务器，不能确认是否另有匹配资产的审核和收据。部署者须核对；若仍未完成，保持采集维护状态，先在已批准的隔离 Linux 环境验收。不要将示例 manifest 当成已通过记录，也不要编造 `passed:true`。
+本次 Mac 实测不能批准生产切换。配套 Audit 已推送起点的 [Camoufox 发布契约](https://github.com/Vicenta-cc/audit-agent-demo/blob/709c3929c5c584d3b596b83b813f7555e14c913d/deploy/camoufox/README.md)明确写有 **G0 安全审核尚未关闭**；已核对截至 `709c392` 该门槛仍未在文档中关闭。本次没有连接服务器，不能确认是否另有匹配资产的审核和收据。部署者须核对；若仍未完成，保持采集维护状态，先在已批准的隔离 Linux 环境验收。不要将示例 manifest 当成已通过记录，也不要编造 `passed:true`。
 
-1. **冻结交付。** 先使选定 Audit `9a0ded4` 在部署环境可取，核对与 Media `7bd9d11` 的配套关系；记录 App/Crawler 实际完整 SHA、前端 dist、解释器、统一后的完整依赖锁、浏览器及模型资源 SHA256。SDK/Playwright 固定为本基线要求。使用 Linux 匹配资产及系统库、字体、可信 CA；生产不执行 `camoufox fetch`，不临时升级依赖碰运气。更新部署 manifest 的源码、前端与资源摘要，不能沿用旧版本的成功收据。
+1. **冻结交付。** 以 Audit 已推送 `709c392` 加本轮经审查发布入口补丁重新冻结候选，核对与 Media 已推送 `32729e8`（业务 `7bd9d11`）的配套关系；记录 App/Crawler 实际完整 SHA、前端 dist、解释器、统一后的完整依赖锁、浏览器及模型资源 SHA256。SDK/Playwright 固定为本基线要求。使用 Linux 匹配资产及系统库、字体、可信 CA；生产不执行 `camoufox fetch`，不临时升级依赖碰运气。更新部署 manifest 的源码、前端与资源摘要，不能沿用旧版本的成功收据。
 2. **预演运行边界。** 当前 `deploy/camoufox/control.py` 只接受 **Linux x86_64**。执行 owner/child preflight 和 Linux 冒烟；使用专用非 root 浏览器用户、私有 headed Xvfb、正确目录权限和真实 FD/ACK 通道。Media Linux 路径没有 DISPLAY 会拒绝启动，不自动创建 Xvfb；不要裸跑 `main.py` 替代 Audit 集成。账号/owner/scheduler DB 不对浏览器用户开放；不关闭 sandbox 或证书校验。现有预检还要求文件描述符软限制至少 4096、`/dev/shm` 总容量至少 1 GiB、状态目录可用磁盘至少 3 GiB，以及浏览器共享库完整；这些是最低检查，不是业务容量测算。
 3. **准备维护窗口。** 保持 `CRAWLER_BROWSER_MAINTENANCE=true`，停止相关正式 API/worker 单元，并证明旧浏览器、node、Xvfb 和任务进程组已退出。旧版本不一定识别新维护开关，因此设置开关不能替代实际停写证明。
 4. **备份并迁移。** 在一致停写窗口备份业务/账号/认证/调度库、必要密钥及关闭的 Profile，检查备份完整性。按迁移服务生成记录，保留账号 ID、用户归属、稳定锁、代理绑定和安全状态；不全库覆盖、不直接导入 Chromium Cookie。
-5. **按正式入口恢复业务。** 使用已审核 manifest、真实资产 hash 和切换收据，保持现有 systemd/relay 拓扑。API/worker 读取同份业务配置及数据路径，`MEDIACRAWLER_DIR` 指向冻结源码，`CRAWLER_LOGIN_PYTHON` 指向 Media 专用解释器。`APP_AUTH_MODE=required`，登录 V2 开启、真实前端 Origin 和登录 WebSocket 均检查通过。新入口清理继承环境，只读取审核白名单；模型、ASR、ffmpeg 等业务必需项必须明确纳入，不能假定旧 shell/.env 的值会被继承。采集先保持维护状态。
-6. **目标环境验收。** 按迁移及维护流程完成授权账号重新登录和身份核对；先 1 条搜索，再真实闲置超过当前出口 TTL 后发起下一次授权采集，检查自动复查、失败仍拦截且不要求无故重扫。随后小量评论与媒体下载，再测作者/其他平台。对 `9a0ded4` 专门验证必要图片/视频补齐与完整解码、清单交付后释放采集线路、审核和后续采集交接，以及进程中断后的幂等恢复。固定并验证 `FFMPEG_PATH`、读写权限、磁盘和解码超时；视频完整校验可能耗时，不把正常执行误判为卡死。确认失败、取消、路由停机和 Profile 稳定性符合预期。不能为了测试绕过维护门槛。
+5. **按正式入口恢复业务。** 使用已审核 manifest、真实资产 hash 和切换收据，保持现有 systemd/relay 拓扑。API/worker 读取同份业务配置及数据路径，`MEDIACRAWLER_DIR` 指向冻结源码，`CRAWLER_LOGIN_PYTHON` 指向 Media 专用解释器。`APP_AUTH_MODE=required`，登录 V2 开启、真实前端 Origin 和登录 WebSocket 均检查通过。新入口清理继承环境；本轮 Audit 补丁还在 Settings 导入处禁止 managed release 从源码 `.env` 补值，不依赖 dotenv 的版本开关。模型、ASR、ffmpeg 等业务必需项必须通过审核的私有配置逐项纳入；确认最终源码已包含该补丁，不能假定旧 shell/.env 会被继承。采集先保持维护状态。
+6. **候选受控放行与目标环境验收。** 候选与正式入口、数据、Profile、账号和线路隔离；完成真实迁移/基础健康记录后，按维护工具的收据契约只解除候选维护，重启候选 API/worker 并验证准入，再完成授权账号重新登录和身份核对。`maintenance.py` 只改 manifest，不热更新进程；普通登录/采集验收须在候选受控解除维护后进行，不能为测试解除旧生产保护；既有受控迁移登录仍可使用匹配账号、owner、migration、operation 的正式授权例外，禁止伪造身份。正式切换必须等候选验收及回退演练完成；按迁移及维护流程先 1 条搜索，再真实闲置超过当前出口 TTL 后发起下一次授权采集，检查自动复查、失败仍拦截且不要求无故重扫。随后小量评论与媒体下载，再测作者/其他平台。对最终 Audit 候选专门验证必要图片/视频补齐与完整解码、清单交付后释放采集线路、审核和后续采集交接，以及进程中断后的幂等恢复。固定并验证 `FFMPEG_PATH`、读写权限、磁盘和解码超时；视频完整校验可能耗时，不把正常执行误判为卡死。确认失败、取消、路由停机和 Profile 稳定性符合预期。不能为了测试绕过维护门槛。
 7. **完整业务与恢复采集。** 验证真实用户登录 → worker 执行 → 图片/视频/评论审核 → 报告 → 问答 → 定向重启后再问答；模型与真实 ASR 需单独验证，health 200 不够。完成审核、迁移、健康及维护解除收据后，按契约恢复准入和实际重启验证。
 
 任一资产/安全门槛、数据库备份、账号身份、出口一致性、Linux 浏览器边界或迁移步骤不通过，则停止扩大范围，保留证据并维持采集暂停。首次迁移失败按发布契约修复 Camoufox 或保持业务维护模式；不自动回退旧引擎。未切换时保留原运行环境，已产生新业务数据后不以旧库回滚。
@@ -264,4 +273,10 @@ VITE_API_PROXY_TARGET=http://127.0.0.1:8499 ./node_modules/.bin/vite --host 127.
 - 本次 Mac 冒烟结果，以及目标 Linux 的安全审核、预检、备份/迁移、登录/采集、完整业务与重启验证结果；未运行项明确标注。
 - 故障时保持采集暂停的方法、备份位置、负责的部署人和实际验收时间。
 
-配套已发布参考：[Audit 当前启动交接](https://github.com/Vicenta-cc/audit-agent-demo/blob/db5d57f8d4f2f88f6f7cb7ceb2bf4acaa85b6bb9/docs/runtime/CURRENT-STARTUP.md)、[统一运行入口](https://github.com/Vicenta-cc/audit-agent-demo/blob/db5d57f8d4f2f88f6f7cb7ceb2bf4acaa85b6bb9/docs/runtime/UNIFIED-RUNTIME.md)。它们用于解释入口，不能替代选定 `9a0ded4` 的源码与配置核对。本仓库下方 README 中的 R2/Cloak/CDP 描述保留作历史或上游通用资料，不作为本次 Camoufox 集成部署依据。
+配套已推送参考：[Audit 当前启动交接](https://github.com/Vicenta-cc/audit-agent-demo/blob/709c3929c5c584d3b596b83b813f7555e14c913d/docs/runtime/CURRENT-STARTUP.md)、[统一运行入口](https://github.com/Vicenta-cc/audit-agent-demo/blob/709c3929c5c584d3b596b83b813f7555e14c913d/docs/runtime/UNIFIED-RUNTIME.md)。它们用于解释入口，不能替代最终 Audit 候选的源码与配置核对。本仓库下方 README 中的 R2/Cloak/CDP 描述保留作历史或上游通用资料，不作为本次 Camoufox 集成部署依据。
+
+## 7. 2026-10-19 发布准备补充
+
+Audit 的发布入口修复通过发布工具 58 项（零跳过）及运行边界 19 项回归；前端历史轮次补丁通过逻辑 50 项、TypeScript 与生产构建，两项均获独立代码及架构审查通过。前端仍依赖 `INVESTIGATION_MULTI_ROUND_ENABLED` 和历史轮次成员数据，权限或成员缺失时保持拒绝，不退到最新轮次或其他端点。
+
+这些结果不代替 Linux 浏览器、账号登录、真实调查和回退演练。Linux 完整哈希锁、wheelhouse、匹配浏览器归档及 G0 资产审查仍须完成。部署先盘点存储及生产版本，不因空间不足删除生产数据，不关闭原有账号/线路保护。
